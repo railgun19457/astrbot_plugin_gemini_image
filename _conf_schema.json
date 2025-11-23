@@ -66,5 +66,23 @@
     "hint": "启用后，LLM 可以在对话中自动调用图像生成功能",
     "type": "bool",
     "default": true
+  },
+  "max_concurrent_generations": {
+    "description": "最大并发生成数",
+    "hint": "同时生成图片的最大数量，防止资源耗尽",
+    "type": "int",
+    "default": 3
+  },
+  "max_requests_per_minute": {
+    "description": "每分钟最大请求数",
+    "hint": "单个用户每分钟最多可以发起的图片生成请求数",
+    "type": "int",
+    "default": 5
+  },
+  "max_image_size_mb": {
+    "description": "最大图片大小（MB）",
+    "hint": "用户上传的参考图片最大允许大小",
+    "type": "int",
+    "default": 10
   }
 }

@@ -10,10 +10,12 @@ import base64
 import mimetypes
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import aiofiles
 import aiohttp
+from PIL import Image
 
 from astrbot.api import logger
 
@@ -75,8 +77,24 @@ class GeminiImageGenerator:
         # 图片缓存字典 {image_id: ImageCache}
         self.image_cache: dict[str, ImageCache] = {}
 
-        # 启动清理任务
-        asyncio.create_task(self._cleanup_cache_loop())
+        # 清理任务追踪
+        self._cleanup_task: asyncio.Task | None = None
+
+    async def start_cleanup(self):
+        """启动缓存清理任务"""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_cache_loop())
+            logger.info("[Gemini Image] 缓存清理任务已启动")
+
+    async def stop_cleanup(self):
+        """停止缓存清理任务"""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("[Gemini Image] 缓存清理任务已停止")
 
     def _get_current_api_key(self) -> str:
         """获取当前使用的 API Key"""
@@ -95,38 +113,19 @@ class GeminiImageGenerator:
     def _convert_image_format(
         self, image_data: bytes, mime_type: str
     ) -> tuple[bytes, str]:
-        """转换不支持的图片格式为 JPEG
-
-        Args:
-            image_data: 原始图片字节数据
-            mime_type: 原始 MIME 类型
-
-        Returns:
-            (转换后的图片数据, 新的 MIME 类型)
-        """
-        # Gemini 支持的图片格式
+        """转换不支持的图片格式为 JPEG"""
         supported_formats = ["image/jpeg", "image/png", "image/webp"]
-
-        # 如果已经是支持的格式，直接返回
         if mime_type in supported_formats:
             return image_data, mime_type
 
-        # 需要转换的格式
-        logger.info(
-            f"[Gemini Image] 检测到不支持的图片格式 {mime_type}，正在转换为 JPEG..."
-        )
+        logger.info(f"[Gemini Image] 转换图片格式: {mime_type} -> image/jpeg")
 
         try:
-            from io import BytesIO
-
-            from PIL import Image
-
             # 打开图片
             img = Image.open(BytesIO(image_data))
 
-            # 如果是 RGBA 模式，转换为 RGB（JPEG 不支持透明度）
+            # 处理透明图片
             if img.mode in ("RGBA", "LA", "P"):
-                # 创建白色背景
                 background = Image.new("RGB", img.size, (255, 255, 255))
                 if img.mode == "P":
                     img = img.convert("RGBA")
@@ -140,12 +139,11 @@ class GeminiImageGenerator:
             img.save(output, format="JPEG", quality=95)
             converted_data = output.getvalue()
 
-            logger.info(f"[Gemini Image] 图片格式转换成功: {mime_type} -> image/jpeg")
+            logger.info("[Gemini Image] 图片格式转换成功")
             return converted_data, "image/jpeg"
 
         except Exception as e:
             logger.error(f"[Gemini Image] 图片格式转换失败: {e}")
-            # 转换失败，返回原始数据
             return image_data, mime_type
 
     async def generate_image(
@@ -193,13 +191,13 @@ class GeminiImageGenerator:
                     "response_modalities": ["IMAGE"],
                 }
 
-                # 添加图片配置（如果需要）
-                if aspect_ratio != "1:1" or image_size:
-                    image_config = {}
-                    if aspect_ratio:
-                        image_config["aspect_ratio"] = aspect_ratio
-                    if image_size:
-                        image_config["image_size"] = image_size
+                # 添加图片配置
+                image_config = {}
+                if aspect_ratio:
+                    image_config["aspect_ratio"] = aspect_ratio
+                if image_size:
+                    image_config["image_size"] = image_size
+                if image_config:
                     generation_config["image_config"] = image_config
 
                 # 构建 parts
@@ -294,36 +292,72 @@ class GeminiImageGenerator:
                             "inline_data": {
                                 "mime_type": "image/png",
                                 "data": "<base64_image_data>"
-                            }
+                            },
+                            "thought": true  // 可选，标记为思考过程图片
                         }
                     ]
                 }
             }]
         }
+
+        对于 Gemini 3 Pro Image Preview 模型：
+        - 会生成多张临时图片（思考过程），这些图片带有 "thought": true
+        - 最终渲染的图片是最后一张不带 "thought" 标志的图片
         """
         try:
+            # 记录响应结构信息，避免输出完整的base64数据
+            candidates_count = len(response.get("candidates", []))
+            logger.debug(f"[Gemini Image] 解析响应: 找到 {candidates_count} 个候选结果")
+
             candidates = response.get("candidates", [])
             if not candidates:
+                logger.warning("[Gemini Image] 响应中没有 candidates")
                 return None
 
             content = candidates[0].get("content", {})
             parts = content.get("parts", [])
 
-            for part in parts:
-                # 检查 inline_data（官方 REST API 格式使用下划线）
-                if "inline_data" in part:
-                    inline_data = part["inline_data"]
-                    image_base64 = inline_data.get("data", "")
-                    if image_base64:
-                        return base64.b64decode(image_base64)
-                # 也兼容驼峰命名格式
-                elif "inlineData" in part:
-                    inline_data = part["inlineData"]
-                    image_base64 = inline_data.get("data", "")
-                    if image_base64:
-                        return base64.b64decode(image_base64)
+            logger.debug(f"[Gemini Image] 找到 {len(parts)} 个 parts")
 
-            return None
+            # 收集所有非思考过程的图片
+            final_images = []
+            for i, part in enumerate(parts):
+                # 检查是否为思考过程图片
+                is_thought = part.get("thought", False)
+
+                if is_thought:
+                    logger.debug(f"[Gemini Image] 跳过思考过程图片 part {i}")
+                    continue
+
+                # 统一处理 inline_data 格式
+                inline_data = part.get("inline_data") or part.get("inlineData")
+                if inline_data:
+                    mime_type = inline_data.get("mime_type") or inline_data.get(
+                        "mimeType", ""
+                    )
+
+                    if mime_type.startswith("image/"):
+                        image_base64 = inline_data.get("data", "")
+                        if image_base64:
+                            logger.debug(
+                                f"[Gemini Image] 找到图片数据，长度: {len(image_base64)} 字符"
+                            )
+                            final_images.append(base64.b64decode(image_base64))
+                        else:
+                            logger.warning(f"[Gemini Image] part {i} 没有图片数据")
+                    else:
+                        logger.debug(f"[Gemini Image] 跳过非图片类型 part {i}")
+                else:
+                    logger.debug(f"[Gemini Image] part {i} 没有 inline_data")
+
+            result = final_images[-1] if final_images else None
+            logger.debug(
+                f"[Gemini Image] 返回 {len(final_images)} 张图片中的最后一张"
+                if final_images
+                else "[Gemini Image] 未找到任何图片"
+            )
+            return result
+
         except Exception as e:
             logger.error(f"[Gemini Image] 解析响应失败: {e}")
             return None
@@ -383,7 +417,17 @@ class GeminiImageGenerator:
             await self._remove_cache(image_id)
             return None
 
-        return cache.data, cache.mime_type
+        # 从文件读取图片数据
+        try:
+            async with aiofiles.open(cache.file_path, "rb") as f:
+                image_data = await f.read()
+            # 从文件扩展名推断 MIME 类型
+            mime_type = mimetypes.guess_type(cache.file_path)[0] or "image/jpeg"
+            return image_data, mime_type
+        except Exception as e:
+            logger.error(f"[Gemini Image] 读取缓存文件失败: {e}")
+            await self._remove_cache(image_id)
+            return None
 
     async def _check_cache_limit(self):
         """检查并清理超出限制的缓存"""
@@ -403,7 +447,6 @@ class GeminiImageGenerator:
         if cache and cache.file_path.exists():
             try:
                 cache.file_path.unlink()
-                logger.debug(f"[Gemini Image] 已删除缓存: {cache.file_path}")
             except Exception as e:
                 logger.error(f"[Gemini Image] 删除缓存文件失败: {e}")
 
