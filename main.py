@@ -77,6 +77,12 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
 
     plugin: object | None = None
 
+    def __post_init__(self):
+        """动态更新 description 以包含当前模型信息"""
+        if self.plugin and hasattr(self.plugin, "model"):
+            model = self.plugin.model
+            self.description = f"使用 Gemini 模型生成图片。当前模型: {model}"
+
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
@@ -120,8 +126,11 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                 return f"❌ 未找到参考图片！\n\n📷 当前可用图片数: {available_count}\n💡 请先发送图片，然后使用图生图功能"
 
             ref_image = recent_images[image_index]
-            image_data = ref_image["data"]
-            mime_type = ref_image["mime_type"]
+            # 从 URL 下载图片
+            result = await plugin._download_image(ref_image["url"])
+            if not result:
+                return "❌ 下载参考图片失败，请重试"
+            image_data, mime_type = result
 
         # 创建异步任务,在后台生成图片
         plugin.create_background_task(
@@ -434,26 +443,32 @@ class GeminiImagePlugin(Star):
     async def _get_reference_image(
         self, event: AstrMessageEvent
     ) -> tuple[bytes | None, str | None]:
-        """获取参考图片（优先从消息中获取）"""
+        """获取参考图片（优先从消息中获取，失败则从缓存获取）"""
         # 从消息链中查找图片
         for component in event.message_obj.message:
             if isinstance(component, Comp.Image):
                 result = await self._download_image_from_component(component)
                 if result:
                     return result
-                break
 
-        # 如果消息中没有图片，尝试从缓存中获取
-        return await self._first_image_from_event(event) or (None, None)
+        # 如果消息中没有图片或下载失败，从缓存 URL 下载
+        recent_images = self.get_recent_images(event.unified_msg_origin)
+        if recent_images:
+            first_image = recent_images[0]
+            return await self._download_image(first_image["url"])
+
+        return None, None
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """监听消息，缓存用户发送的图片"""
+        """监听消息，缓存用户发送的图片 URL"""
         for component in event.message_obj.message:
             if isinstance(component, Comp.Image):
-                result = await self._download_image_from_component(component)
-                if result:
-                    self._remember_user_image(event.unified_msg_origin, *result)
+                image_url = component.url or component.file
+                if image_url:
+                    self._remember_user_image_url(
+                        event.unified_msg_origin, image_url, "image/jpeg"
+                    )
 
     def get_recent_images(self, session_id: str) -> list[dict]:
         """获取会话的最近图片"""
@@ -531,24 +546,15 @@ class GeminiImagePlugin(Star):
             logger.error(f"[Gemini Image] 下载图片时出错: {exc}")
             return None
 
-    async def _first_image_from_event(
-        self, event: AstrMessageEvent
-    ) -> tuple[bytes, str] | None:
-        """获取消息链中的第一张图片"""
-        for component in event.message_obj.message:
-            if isinstance(component, Comp.Image):
-                return await self._download_image_from_component(component)
-        return None
-
-    def _remember_user_image(
-        self, session_id: str, image_data: bytes, mime_type: str | None
+    def _remember_user_image_url(
+        self, session_id: str, image_url: str, mime_type: str | None
     ) -> None:
-        """缓存用户发送的图片以便作为参考"""
+        """缓存用户发送的图片 URL（而非完整数据，节省内存）"""
         session_images = self.recent_images.setdefault(session_id, [])
         session_images.insert(
             0,
             {
-                "data": image_data,
+                "url": image_url,
                 "mime_type": mime_type or "image/jpeg",
                 "timestamp": time.time(),
             },
@@ -559,8 +565,16 @@ class GeminiImagePlugin(Star):
             del session_images[self.max_images_per_session :]
 
         logger.info(
-            f"[Gemini Image] 已缓存用户图片，会话 {session_id} 当前有 {len(session_images)} 张图片"
+            f"[Gemini Image] 已缓存用户图片 URL，会话 {session_id} 当前有 {len(session_images)} 张图片"
         )
+
+        # 定期清理所有会话的过期图片（每10次缓存操作清理一次）
+        if not hasattr(self, "_cache_counter"):
+            self._cache_counter = 0
+        self._cache_counter += 1
+        if self._cache_counter >= 10:
+            self._cache_counter = 0
+            self._cleanup_expired_images()
 
     async def _generate_and_send_image_async(
         self,
