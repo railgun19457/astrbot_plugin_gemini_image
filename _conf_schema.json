@@ -26,7 +26,7 @@
   },
   "model": {
     "description": "生图模型",
-    "hint": "选择要使用的 Gemini 图像生成模型，选择 custom 时使用下方自定义模型名称",
+    "hint": "选择要使用的 Gemini 图像生成模型，选择 '自定义模型' 时使用下方自定义模型名称",
     "type": "string",
     "default": "gemini-2.0-flash-exp-image-generation",
     "options": [
@@ -39,7 +39,7 @@
   },
   "custom_model": {
     "description": "自定义模型名称",
-    "hint": "仅在上方模型选择 custom 时生效。填写自定义的 Gemini 图像生成模型名称",
+    "hint": "仅在上方模型选择 '自定义模型' 时生效。填写自定义的 Gemini 图像生成模型名称",
     "type": "string",
     "default": ""
   },
@@ -66,6 +66,35 @@
     "hint": "启用后，LLM 可以在对话中自动调用图像生成功能",
     "type": "bool",
     "default": true
+  },
+  "default_aspect_ratio": {
+    "description": "默认宽高比",
+    "hint": "使用命令生图时默认使用的图片宽高比",
+    "type": "string",
+    "default": "1:1",
+    "options": [
+      "1:1",
+      "2:3",
+      "3:2",
+      "3:4",
+      "4:3",
+      "4:5",
+      "5:4",
+      "9:16",
+      "16:9",
+      "21:9"
+    ]
+  },
+  "default_resolution": {
+    "description": "默认分辨率",
+    "hint": "使用命令生图时默认使用的图片分辨率，仅 Gemini 3 Pro 模型支持",
+    "type": "string",
+    "default": "1K",
+    "options": [
+      "1K",
+      "2K",
+      "4K"
+    ]
   },
   "max_concurrent_generations": {
     "description": "最大并发生成数",

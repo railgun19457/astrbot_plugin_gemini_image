@@ -30,6 +30,8 @@
 | `max_concurrent_generations` | number       | `3`                                           | 最大并发生成数                            |
 | `max_requests_per_minute`    | number       | `5`                                           | 每分钟最大请求数                          |
 | `enable_llm_tool`            | boolean      | `true`                                        | 是否启用LLM工具集成                       |
+| `default_aspect_ratio`       | string       | `"1:1"`                                       | /img命令的默认宽高比                       |
+| `default_resolution`         | string       | `"1K"`                                        | /img命令的默认分辨率                       |
 
 ### 支持的模型
 - `gemini-2.0-flash-exp-image-generation`

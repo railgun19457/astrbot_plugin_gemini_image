@@ -77,25 +77,6 @@ class GeminiImageGenerator:
         # 图片缓存字典 {image_id: ImageCache}
         self.image_cache: dict[str, ImageCache] = {}
 
-        # 清理任务追踪
-        self._cleanup_task: asyncio.Task | None = None
-
-    async def start_cleanup(self):
-        """启动缓存清理任务"""
-        if self._cleanup_task is None or self._cleanup_task.done():
-            self._cleanup_task = asyncio.create_task(self._cleanup_cache_loop())
-            logger.info("[Gemini Image] 缓存清理任务已启动")
-
-    async def stop_cleanup(self):
-        """停止缓存清理任务"""
-        if self._cleanup_task and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            logger.info("[Gemini Image] 缓存清理任务已停止")
-
     def _get_current_api_key(self) -> str:
         """获取当前使用的 API Key"""
         if not self.api_keys:
@@ -154,213 +135,195 @@ class GeminiImageGenerator:
         aspect_ratio: str = "1:1",
         image_size: str | None = None,
     ) -> tuple[bytes | None, str | None]:
-        """
-        统一的图像生成接口，支持文生图和图生图
-
-        Args:
-            prompt: 生成图片的文本提示词
-            image_data: 可选的参考图片字节数据，为 None 时执行文生图，否则执行图生图
-            mime_type: 参考图片的 MIME 类型
-            aspect_ratio: 宽高比，支持 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9
-            image_size: 图片分辨率（仅 Gemini 3 Pro），支持 1K, 2K, 4K
-
-        Returns:
-            (图片字节数据, 错误信息)
-        """
+        """统一的图像生成接口，支持文生图和图生图"""
         if not self.api_keys:
             return None, "未配置 API Key"
 
-        # 如果有参考图片，转换格式（如果需要）
+        # 转换图片格式（如果需要）
         if image_data and mime_type:
             image_data, mime_type = self._convert_image_format(image_data, mime_type)
 
         # 尝试所有可用的 API Key
-        last_error = None
         for attempt in range(len(self.api_keys)):
-            api_key = self._get_current_api_key()
+            result = await self._try_generate_with_current_key(
+                prompt, image_data, mime_type, aspect_ratio, image_size
+            )
 
-            try:
-                url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": api_key,
+            if result[0] is not None:  # 成功
+                return result
+
+            # 如果有多个 key 且不是最后一次尝试，切换到下一个 key
+            if len(self.api_keys) > 1 and attempt < len(self.api_keys) - 1:
+                self._rotate_api_key()
+
+        return None, result[1] or "所有 API Key 都失败了"
+
+    async def _try_generate_with_current_key(
+        self,
+        prompt: str,
+        image_data: bytes | None,
+        mime_type: str | None,
+        aspect_ratio: str,
+        image_size: str | None,
+    ) -> tuple[bytes | None, str | None]:
+        """使用当前 API Key 尝试生成图片"""
+        try:
+            payload = self._build_request_payload(
+                prompt, image_data, mime_type, aspect_ratio, image_size
+            )
+
+            mode = "图生图" if image_data else "文生图"
+            logger.info(
+                f"[Gemini Image] 开始{mode}，提示词: {prompt[:50]}... (Key 索引: {self.current_key_index})"
+            )
+
+            async with aiohttp.ClientSession() as session:
+                response_data = await self._make_api_request(session, payload)
+                if response_data is None:
+                    return None, "API 请求失败"
+
+                # 解析响应获取图片数据
+                result_image_data = self._extract_image_from_response(response_data)
+                if result_image_data:
+                    logger.info(f"[Gemini Image] {mode}成功")
+                    return result_image_data, None
+
+                logger.error("[Gemini Image] 响应中未找到图片数据")
+                return None, "响应中未找到图片数据"
+
+        except asyncio.TimeoutError:
+            logger.error("[Gemini Image] 生成超时")
+            return None, "生成超时"
+        except Exception as e:
+            logger.error(f"[Gemini Image] 生成失败: {e}")
+            return None, f"生成失败: {str(e)}"
+
+    def _build_request_payload(
+        self,
+        prompt: str,
+        image_data: bytes | None,
+        mime_type: str | None,
+        aspect_ratio: str,
+        image_size: str | None,
+    ) -> dict:
+        """构建 API 请求 payload"""
+        generation_config = {"responseModalities": ["IMAGE"]}
+
+        # 添加图片配置
+        image_config = {}
+        if aspect_ratio:
+            image_config["aspectRatio"] = aspect_ratio
+
+        # imageSize 仅 gemini-3-pro-image-preview 支持
+        if image_size and "gemini-3" in self.model.lower():
+            image_config["imageSize"] = image_size
+
+        if image_config:
+            generation_config["imageConfig"] = image_config
+
+        # 构建 parts
+        parts = [{"text": prompt}]
+        if image_data and mime_type:
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(image_data).decode("utf-8"),
+                    }
                 }
+            )
 
-                # 构建配置
-                generation_config = {
-                    "response_modalities": ["IMAGE"],
-                }
-
-                # 添加图片配置
-                image_config = {}
-                if aspect_ratio:
-                    image_config["aspect_ratio"] = aspect_ratio
-                if image_size:
-                    image_config["image_size"] = image_size
-                if image_config:
-                    generation_config["image_config"] = image_config
-
-                # 构建 parts
-                parts = [{"text": prompt}]
-
-                # 如果有参考图片，添加到 parts
-                if image_data and mime_type:
-                    image_base64 = base64.b64encode(image_data).decode("utf-8")
-                    parts.append(
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": image_base64,
-                            }
-                        }
-                    )
-
-                payload = {
-                    "contents": [{"parts": parts}],
-                    "generation_config": generation_config,
-                }
-
-                mode = "图生图" if image_data else "文生图"
-                logger.info(
-                    f"[Gemini Image] 开始{mode}，提示词: {prompt[:50]}... (Key 索引: {self.current_key_index})"
-                )
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            logger.error(
-                                f"[Gemini Image] API 错误: {response.status} - {error_text}"
-                            )
-                            last_error = f"API 请求失败: {response.status}"
-
-                            # 如果是认证错误或配额错误，尝试下一个 key
-                            if (
-                                response.status in [401, 403, 429]
-                                and len(self.api_keys) > 1
-                            ):
-                                logger.warning(
-                                    f"[Gemini Image] Key 失败，尝试下一个 (错误: {response.status})"
-                                )
-                                self._rotate_api_key()
-                                continue
-
-                            return None, last_error
-
-                        result = await response.json()
-
-                        # 解析响应获取图片数据
-                        result_image_data = self._extract_image_from_response(result)
-                        if result_image_data:
-                            logger.info(f"[Gemini Image] {mode}成功")
-                            return result_image_data, None
-                        else:
-                            logger.error("[Gemini Image] 响应中未找到图片数据")
-                            return None, "响应中未找到图片数据"
-
-            except asyncio.TimeoutError:
-                logger.error("[Gemini Image] 生成超时")
-                last_error = "生成超时"
-                # 超时也尝试下一个 key
-                if len(self.api_keys) > 1 and attempt < len(self.api_keys) - 1:
-                    self._rotate_api_key()
-                    continue
-            except Exception as e:
-                logger.error(f"[Gemini Image] 生成失败: {e}")
-                last_error = f"生成失败: {str(e)}"
-                # 其他错误也尝试下一个 key
-                if len(self.api_keys) > 1 and attempt < len(self.api_keys) - 1:
-                    self._rotate_api_key()
-                    continue
-
-        return None, last_error or "所有 API Key 都失败了"
-
-    def _extract_image_from_response(self, response: dict) -> bytes | None:
-        """从 API 响应中提取图片数据
-
-        根据官方文档，响应格式为：
-        {
-            "candidates": [{
-                "content": {
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": "<base64_image_data>"
-                            },
-                            "thought": true  // 可选，标记为思考过程图片
-                        }
-                    ]
-                }
-            }]
+        return {
+            "contents": [{"parts": parts}],
+            "generationConfig": generation_config,
         }
 
-        对于 Gemini 3 Pro Image Preview 模型：
-        - 会生成多张临时图片（思考过程），这些图片带有 "thought": true
-        - 最终渲染的图片是最后一张不带 "thought" 标志的图片
-        """
-        try:
-            # 记录响应结构信息，避免输出完整的base64数据
-            candidates_count = len(response.get("candidates", []))
-            logger.debug(f"[Gemini Image] 解析响应: 找到 {candidates_count} 个候选结果")
+    async def _make_api_request(
+        self, session: aiohttp.ClientSession, payload: dict
+    ) -> dict | None:
+        """发送 API 请求并处理响应"""
+        url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self._get_current_api_key(),
+        }
 
+        # 调试：打印实际发送的 payload 结构（不含图片数据）
+        debug_payload = {
+            "contents": payload["contents"],
+            "generationConfig": payload["generationConfig"]
+        }
+        logger.debug(f"[Gemini Image] 请求 payload: {debug_payload}")
+
+        async with session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"[Gemini Image] API 错误: {response.status} - {error_text}")
+
+                # 如果是认证错误或配额错误，尝试下一个 key
+                if response.status in [401, 403, 429] and len(self.api_keys) > 1:
+                    logger.warning(
+                        f"[Gemini Image] Key 失败，尝试下一个 (错误: {response.status})"
+                    )
+                return None
+
+            return await response.json()
+
+    def _extract_image_from_response(self, response: dict) -> bytes | None:
+        """从 API 响应中提取图片数据"""
+        try:
             candidates = response.get("candidates", [])
+            logger.debug(f"[Gemini Image] 解析响应: 找到 {len(candidates)} 个候选结果")
+
             if not candidates:
                 logger.warning("[Gemini Image] 响应中没有 candidates")
                 return None
 
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-
+            parts = candidates[0].get("content", {}).get("parts", [])
             logger.debug(f"[Gemini Image] 找到 {len(parts)} 个 parts")
 
-            # 收集所有非思考过程的图片
-            final_images = []
+            # 收集所有图片
+            images = []
             for i, part in enumerate(parts):
-                # 检查是否为思考过程图片
-                is_thought = part.get("thought", False)
+                image_data = self._extract_image_from_part(part, i)
+                if image_data:
+                    images.append(image_data)
 
-                if is_thought:
-                    logger.debug(f"[Gemini Image] 跳过思考过程图片 part {i}")
-                    continue
+            if images:
+                logger.debug(f"[Gemini Image] 返回 {len(images)} 张图片中的最后一张")
+                return images[-1]
 
-                # 统一处理 inline_data 格式
-                inline_data = part.get("inline_data") or part.get("inlineData")
-                if inline_data:
-                    mime_type = inline_data.get("mime_type") or inline_data.get(
-                        "mimeType", ""
-                    )
-
-                    if mime_type.startswith("image/"):
-                        image_base64 = inline_data.get("data", "")
-                        if image_base64:
-                            logger.debug(
-                                f"[Gemini Image] 找到图片数据，长度: {len(image_base64)} 字符"
-                            )
-                            final_images.append(base64.b64decode(image_base64))
-                        else:
-                            logger.warning(f"[Gemini Image] part {i} 没有图片数据")
-                    else:
-                        logger.debug(f"[Gemini Image] 跳过非图片类型 part {i}")
-                else:
-                    logger.debug(f"[Gemini Image] part {i} 没有 inline_data")
-
-            result = final_images[-1] if final_images else None
-            logger.debug(
-                f"[Gemini Image] 返回 {len(final_images)} 张图片中的最后一张"
-                if final_images
-                else "[Gemini Image] 未找到任何图片"
-            )
-            return result
+            logger.debug("[Gemini Image] 未找到任何图片")
+            return None
 
         except Exception as e:
             logger.error(f"[Gemini Image] 解析响应失败: {e}")
             return None
+
+    def _extract_image_from_part(self, part: dict, index: int) -> bytes | None:
+        """从单个 part 中提取图片数据"""
+        inline_data = part.get("inline_data") or part.get("inlineData")
+        if not inline_data:
+            logger.debug(f"[Gemini Image] part {index} 没有 inline_data")
+            return None
+
+        mime_type = inline_data.get("mime_type") or inline_data.get("mimeType", "")
+        if not mime_type.startswith("image/"):
+            logger.debug(f"[Gemini Image] 跳过非图片类型 part {index}")
+            return None
+
+        image_base64 = inline_data.get("data", "")
+        if not image_base64:
+            logger.warning(f"[Gemini Image] part {index} 没有图片数据")
+            return None
+
+        logger.debug(f"[Gemini Image] 找到图片数据，长度: {len(image_base64)} 字符")
+        return base64.b64decode(image_base64)
 
     async def cache_image(
         self, image_id: str, image_data: bytes, mime_type: str = "image/jpeg"
@@ -398,37 +361,6 @@ class GeminiImageGenerator:
         logger.info(f"[Gemini Image] 图片已缓存: {file_path}")
         return file_path
 
-    async def get_cached_image(self, image_id: str) -> tuple[bytes, str] | None:
-        """
-        获取缓存的图片
-
-        Args:
-            image_id: 图片唯一标识
-
-        Returns:
-            (图片字节数据, MIME 类型) 或 None
-        """
-        cache = self.image_cache.get(image_id)
-        if not cache:
-            return None
-
-        # 检查是否过期
-        if time.time() - cache.timestamp > self.cache_ttl:
-            await self._remove_cache(image_id)
-            return None
-
-        # 从文件读取图片数据
-        try:
-            async with aiofiles.open(cache.file_path, "rb") as f:
-                image_data = await f.read()
-            # 从文件扩展名推断 MIME 类型
-            mime_type = mimetypes.guess_type(cache.file_path)[0] or "image/jpeg"
-            return image_data, mime_type
-        except Exception as e:
-            logger.error(f"[Gemini Image] 读取缓存文件失败: {e}")
-            await self._remove_cache(image_id)
-            return None
-
     async def _check_cache_limit(self):
         """检查并清理超出限制的缓存"""
         if len(self.image_cache) <= self.max_cache_count:
@@ -449,25 +381,3 @@ class GeminiImageGenerator:
                 cache.file_path.unlink()
             except Exception as e:
                 logger.error(f"[Gemini Image] 删除缓存文件失败: {e}")
-
-    async def _cleanup_cache_loop(self):
-        """定期清理过期缓存"""
-        while True:
-            try:
-                await asyncio.sleep(300)  # 每 5 分钟检查一次
-
-                current_time = time.time()
-                expired_ids = [
-                    image_id
-                    for image_id, cache in self.image_cache.items()
-                    if current_time - cache.timestamp > self.cache_ttl
-                ]
-
-                for image_id in expired_ids:
-                    await self._remove_cache(image_id)
-
-                if expired_ids:
-                    logger.info(f"[Gemini Image] 清理了 {len(expired_ids)} 个过期缓存")
-
-            except Exception as e:
-                logger.error(f"[Gemini Image] 缓存清理失败: {e}")
