@@ -188,6 +188,7 @@ class GeminiImagePlugin(Star):
         self.enable_llm_tool = self.config.get("enable_llm_tool", True)
         self.default_aspect_ratio = self.config.get("default_aspect_ratio", "1:1")
         self.default_resolution = self.config.get("default_resolution", "1K")
+        self.presets = self._load_presets()
         self._validate_config()
 
     def _load_provider_config(self, provider_id: str) -> bool:
@@ -233,6 +234,46 @@ class GeminiImagePlugin(Star):
             return custom_model
         logger.warning("[Gemini Image] 选择了自定义模型但未配置 custom_model，将使用默认模型")
         return "gemini-2.0-flash-exp-image-generation"
+
+    def _load_presets(self) -> dict[str, str]:
+        """加载预设提示词配置
+
+        格式: "名称:提示词"，第一个冒号前为名称，后面全部为提示词
+
+        Returns:
+            预设名称到提示词的映射字典
+        """
+        presets_config = self.config.get("presets", [])
+        presets_dict = {}
+
+        if not isinstance(presets_config, list):
+            logger.warning("[Gemini Image] 预设配置格式错误，应为列表")
+            return presets_dict
+
+        for preset_str in presets_config:
+            if not isinstance(preset_str, str):
+                continue
+
+            # 使用第一个冒号分割，前面是名称，后面全部是提示词
+            if ":" not in preset_str:
+                logger.warning(f"[Gemini Image] 预设格式错误（缺少冒号）: {preset_str}")
+                continue
+
+            # 只分割第一个冒号
+            name, prompt = preset_str.split(":", 1)
+            name = name.strip()
+            prompt = prompt.strip()
+
+            if name and prompt:
+                presets_dict[name] = prompt
+                logger.debug(f"[Gemini Image] 加载预设: {name}")
+            else:
+                logger.warning(f"[Gemini Image] 预设格式错误（名称或提示词为空）: {preset_str}")
+
+        if presets_dict:
+            logger.info(f"[Gemini Image] 已加载 {len(presets_dict)} 个预设提示词")
+
+        return presets_dict
 
     def _validate_numeric_config(
         self,
@@ -319,25 +360,52 @@ class GeminiImagePlugin(Star):
                 return [keys] if isinstance(keys, str) else [k for k in keys if k]
         return []
 
-    @filter.command("img")
+    @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令
 
         用法:
-        /img <提示词> - 文生图
-        /img <提示词> (引用包含图片的消息) - 图生图（支持多张图片）
+        /生图 <提示词或预设名称> - 文生图
+        /生图 <提示词或预设名称> (引用包含图片的消息) - 图生图（支持多张图片）
         """
-        prompt = event.message_str.strip()
-        if not prompt:
-            yield event.plain_result(
-                "❌ 请提供图片生成的提示词！\n\n📝 用法示例:\n• /img 一只可爱的小猫\n• /img 未来城市的风景"
-            )
+        user_input = event.message_str.strip()
+
+        # 如果 message_str 包含指令名称，需要移除
+        # 某些情况下 message_str 可能是 "生图 浴室1" 而不是 "浴室1"
+        if user_input.startswith("生图 "):
+            user_input = user_input[3:].strip()  # 移除 "生图 " 前缀
+        elif user_input == "生图":
+            user_input = ""  # 只有指令名称，没有参数
+
+        if not user_input:
+            # 构建帮助信息
+            help_text = "❌ 请提供图片生成的提示词或预设名称！\n\n📝 用法示例:\n• /生图 一只可爱的小猫\n• /生图 未来城市的风景"
+
+            # 如果有预设，显示可用预设列表
+            if self.presets:
+                preset_names = "、".join(self.presets.keys())
+                help_text += f"\n\n✨ 可用预设: {preset_names}"
+
+            yield event.plain_result(help_text)
             return
+
+        # 检查是否使用预设
+        if user_input in self.presets:
+            prompt = self.presets[user_input]
+            logger.info(f"[Gemini Image] 使用预设 '{user_input}': {prompt[:50]}...")
+        else:
+            # 不是预设，直接使用用户输入作为提示词
+            prompt = user_input
 
         # 获取参考图片列表
         images_data = await self._get_reference_images_for_tool(event, num_cached_images=3)
         mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
-        yield event.plain_result(f"已开始{mode}任务")
+
+        # 如果使用了预设，在提示中显示预设名称
+        if user_input in self.presets:
+            yield event.plain_result(f"已开始{mode}任务（预设: {user_input}）")
+        else:
+            yield event.plain_result(f"已开始{mode}任务")
 
         # 创建异步任务,在后台生成图片
         self.create_background_task(
