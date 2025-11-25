@@ -26,7 +26,6 @@ class ImageCache:
 
     file_path: Path
     timestamp: float
-    data: bytes
     mime_type: str
 
 
@@ -110,9 +109,11 @@ class GeminiImageGenerator:
                 background = Image.new("RGB", img.size, (255, 255, 255))
                 if img.mode == "P":
                     img = img.convert("RGBA")
-                background.paste(
-                    img, mask=img.split()[-1] if img.mode == "RGBA" else None
-                )
+                elif img.mode == "LA":
+                    img = img.convert("RGBA")
+
+                # 此时 img.mode 一定是 RGBA，使用第4个通道作为 alpha mask
+                background.paste(img, mask=img.split()[3])
                 img = background
 
             # 转换为 JPEG
@@ -130,23 +131,36 @@ class GeminiImageGenerator:
     async def generate_image(
         self,
         prompt: str,
-        image_data: bytes | None = None,
-        mime_type: str | None = None,
+        images_data: list[tuple[bytes, str]] | None = None,
         aspect_ratio: str = "1:1",
         image_size: str | None = None,
     ) -> tuple[bytes | None, str | None]:
-        """统一的图像生成接口，支持文生图和图生图"""
+        """统一的图像生成接口，支持文生图和图生图（支持多张参考图片）
+
+        Args:
+            prompt: 生成提示词
+            images_data: 参考图片列表，每个元素为 (image_data, mime_type) 元组
+            aspect_ratio: 宽高比
+            image_size: 图片尺寸
+
+        Returns:
+            (生成的图片数据, 错误信息) 元组
+        """
         if not self.api_keys:
             return None, "未配置 API Key"
 
-        # 转换图片格式（如果需要）
-        if image_data and mime_type:
-            image_data, mime_type = self._convert_image_format(image_data, mime_type)
+        # 转换所有图片格式（如果需要）
+        converted_images = []
+        if images_data:
+            for image_data, mime_type in images_data:
+                converted_data, converted_mime = self._convert_image_format(image_data, mime_type)
+                converted_images.append((converted_data, converted_mime))
 
         # 尝试所有可用的 API Key
+        result = (None, "未配置 API Key")
         for attempt in range(len(self.api_keys)):
             result = await self._try_generate_with_current_key(
-                prompt, image_data, mime_type, aspect_ratio, image_size
+                prompt, converted_images, aspect_ratio, image_size
             )
 
             if result[0] is not None:  # 成功
@@ -161,18 +175,17 @@ class GeminiImageGenerator:
     async def _try_generate_with_current_key(
         self,
         prompt: str,
-        image_data: bytes | None,
-        mime_type: str | None,
+        images_data: list[tuple[bytes, str]],
         aspect_ratio: str,
         image_size: str | None,
     ) -> tuple[bytes | None, str | None]:
         """使用当前 API Key 尝试生成图片"""
         try:
             payload = self._build_request_payload(
-                prompt, image_data, mime_type, aspect_ratio, image_size
+                prompt, images_data, aspect_ratio, image_size
             )
 
-            mode = "图生图" if image_data else "文生图"
+            mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
             logger.info(
                 f"[Gemini Image] 开始{mode}，提示词: {prompt[:50]}... (Key 索引: {self.current_key_index})"
             )
@@ -201,12 +214,21 @@ class GeminiImageGenerator:
     def _build_request_payload(
         self,
         prompt: str,
-        image_data: bytes | None,
-        mime_type: str | None,
+        images_data: list[tuple[bytes, str]],
         aspect_ratio: str,
         image_size: str | None,
     ) -> dict:
-        """构建 API 请求 payload"""
+        """构建 API 请求 payload（支持多张参考图片）
+
+        Args:
+            prompt: 生成提示词
+            images_data: 参考图片列表，每个元素为 (image_data, mime_type) 元组
+            aspect_ratio: 宽高比
+            image_size: 图片尺寸
+
+        Returns:
+            API 请求 payload
+        """
         generation_config = {"responseModalities": ["IMAGE"]}
 
         # 添加图片配置
@@ -221,17 +243,20 @@ class GeminiImageGenerator:
         if image_config:
             generation_config["imageConfig"] = image_config
 
-        # 构建 parts
+        # 构建 parts - 先添加提示词
         parts = [{"text": prompt}]
-        if image_data and mime_type:
-            parts.append(
-                {
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": base64.b64encode(image_data).decode("utf-8"),
+
+        # 添加所有参考图片
+        if images_data:
+            for image_data, mime_type in images_data:
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64.b64encode(image_data).decode("utf-8"),
+                        }
                     }
-                }
-            )
+                )
 
         return {
             "contents": [{"parts": parts}],
@@ -250,7 +275,6 @@ class GeminiImageGenerator:
 
         # 调试：打印实际请求信息
         logger.info(f"[Gemini Image] 请求 URL: {url}")
-        logger.debug(f"[Gemini Image] 请求 payload: {payload.get('contents', [])[0] if payload.get('contents') else 'N/A'}")
 
         async with session.post(
             url,
@@ -348,7 +372,6 @@ class GeminiImageGenerator:
         self.image_cache[image_id] = ImageCache(
             file_path=file_path,
             timestamp=time.time(),
-            data=image_data,
             mime_type=mime_type,
         )
 
@@ -359,16 +382,25 @@ class GeminiImageGenerator:
         return file_path
 
     async def _check_cache_limit(self):
-        """检查并清理超出限制的缓存"""
-        if len(self.image_cache) <= self.max_cache_count:
-            return
+        """检查并清理超出限制的缓存（基于数量和时间）"""
+        current_time = time.time()
 
-        # 按时间戳排序，删除最旧的
-        sorted_cache = sorted(self.image_cache.items(), key=lambda x: x[1].timestamp)
+        # 首先清理过期的缓存
+        expired_ids = [
+            image_id for image_id, cache in self.image_cache.items()
+            if current_time - cache.timestamp > self.cache_ttl
+        ]
 
-        to_remove = len(self.image_cache) - self.max_cache_count
-        for image_id, _ in sorted_cache[:to_remove]:
+        for image_id in expired_ids:
             await self._remove_cache(image_id)
+            logger.debug(f"[Gemini Image] 清理过期缓存: {image_id}")
+
+        # 如果清理后仍超出数量限制，删除最旧的
+        if len(self.image_cache) > self.max_cache_count:
+            sorted_cache = sorted(self.image_cache.items(), key=lambda x: x[1].timestamp)
+            to_remove = len(self.image_cache) - self.max_cache_count
+            for image_id, _ in sorted_cache[:to_remove]:
+                await self._remove_cache(image_id)
 
     async def _remove_cache(self, image_id: str):
         """删除缓存"""

@@ -28,7 +28,7 @@
     "description": "生图模型",
     "hint": "选择要使用的 Gemini 图像生成模型，选择 '自定义模型' 时使用下方自定义模型名称",
     "type": "string",
-    "default": "gemini-2.0-flash-exp-image-generation",
+    "default": "gemini-2.5-flash-image-preview",
     "options": [
       "gemini-2.0-flash-exp-image-generation",
       "gemini-2.5-flash-image",

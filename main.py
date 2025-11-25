@@ -39,7 +39,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "生成图片时使用的详细提示词(推荐英文或中文)",
+                    "description": "生图时使用的提示词(直接将用户的要求翻译为英文)",
                 },
                 "aspect_ratio": {
                     "type": "string",
@@ -62,13 +62,9 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                     "description": "图片分辨率，仅 gemini-3-pro-image-preview 模型支持",
                     "enum": ["1K", "2K", "4K"],
                 },
-                "use_reference_image": {
-                    "type": "boolean",
-                    "description": "是否使用参考图片,默认: false",
-                },
-                "reference_image_index": {
+                "num_cached_images": {
                     "type": "number",
-                    "description": "参考图片的索引,从0开始。仅在 use_reference_image=true 时有效。默认使用最新的图片(0)",
+                    "description": "使用最近缓存的图片数量（当用户没有直接提供图片时）。0=不使用缓存，1=使用最新1张，2=使用最新2张，最多3张。默认: 0",
                 },
             },
             "required": ["prompt"],
@@ -96,30 +92,30 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
         if not event:
             return "❌ 无法获取当前消息上下文"
 
-        image_data, mime_type = None, None
-        if kwargs.get("use_reference_image", False):
-            recent_images = plugin.get_recent_images(event.unified_msg_origin)
-            image_index = int(kwargs.get("reference_image_index", 0))
-            if not recent_images or image_index >= len(recent_images):
-                return f"❌ 未找到参考图片！\n\n📷 当前可用图片数: {len(recent_images) if recent_images else 0}\n💡 请先发送图片，然后使用图生图功能"
+        # 快速验证配置
+        if not plugin.generator.api_keys:
+            return "❌ 未配置 API Key，无法生成图片"
 
-            if not (result := await plugin._download_image(recent_images[image_index]["url"])):
-                return "❌ 下载参考图片失败，请重试"
-            image_data, mime_type = result
+        # 获取参考图片（优先从消息中获取，可选使用缓存）
+        num_cached = int(kwargs.get("num_cached_images", 0))
+        images_data = await plugin._get_reference_images_for_tool(
+            event,
+            num_cached_images=max(0, min(num_cached, 3))  # 限制在 0-3 之间
+        )
 
         plugin.create_background_task(
             plugin._generate_and_send_image_async(
                 prompt=prompt,
-                image_data=image_data,
-                mime_type=mime_type,
+                images_data=images_data or None,
                 unified_msg_origin=event.unified_msg_origin,
-                use_reference_image=image_data is not None,
                 aspect_ratio=kwargs.get("aspect_ratio", "1:1"),
                 resolution=kwargs.get("resolution", "1K"),
             )
         )
 
-        return "[图片生成任务已启动，请等待结果]"
+        # 返回简短确认，让 LLM 基于此生成自然的回复
+        mode = "图生图" if images_data else "文生图"
+        return f"已启动{mode}任务"
 
 
 class GeminiImagePlugin(Star):
@@ -134,7 +130,7 @@ class GeminiImagePlugin(Star):
     MAX_IMAGE_SIZE_MB = 50  # 最大图片大小 (MB)
     DEFAULT_MAX_CONCURRENT_GENERATIONS = 3  # 默认最大并发生成数
     MAX_CONCURRENT_GENERATIONS = 10  # 最大并发生成数
-    DEFAULT_MAX_IMAGES_PER_SESSION = 5  # 默认每会话最大图片数
+    MAX_IMAGES_PER_SESSION = 3  # 每会话最大图片数（硬编码，仅作为备用）
     IMAGE_CACHE_TTL = 3600  # 图片缓存过期时间 (秒)
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -155,9 +151,9 @@ class GeminiImagePlugin(Star):
             max_cache_count=self.max_cache_count,
         )
 
-        # 存储最近收到的图片 {session_id: [{"data": bytes, "mime_type": str, "timestamp": float}]}
+        # 存储最近收到的图片 {session_id: [{"url": str, "mime_type": str, "timestamp": float}]}
         self.recent_images: dict[str, list[dict]] = {}
-        self.max_images_per_session = self.DEFAULT_MAX_IMAGES_PER_SESSION
+        self.max_images_per_session = self.MAX_IMAGES_PER_SESSION  # 硬编码为3
         # max_image_size 已在 _validate_config 中设置
         self.image_cache_ttl = self.IMAGE_CACHE_TTL  # 图片缓存过期时间（秒）
 
@@ -230,12 +226,12 @@ class GeminiImagePlugin(Star):
     def _load_model_config(self) -> str:
         """加载模型配置"""
         model = self.config.get("model", "gemini-2.0-flash-exp-image-generation")
-        if model != "custom":
+        if model != "自定义模型":
             return model
         if custom_model := self.config.get("custom_model", "").strip():
             logger.info(f"[Gemini Image] 使用自定义模型: {custom_model}")
             return custom_model
-        logger.warning("[Gemini Image] 选择了 custom 但未配置 custom_model，将使用默认模型")
+        logger.warning("[Gemini Image] 选择了自定义模型但未配置 custom_model，将使用默认模型")
         return "gemini-2.0-flash-exp-image-generation"
 
     def _validate_numeric_config(
@@ -329,7 +325,7 @@ class GeminiImagePlugin(Star):
 
         用法:
         /img <提示词> - 文生图
-        /img <提示词> (引用包含图片的消息) - 图生图
+        /img <提示词> (引用包含图片的消息) - 图生图（支持多张图片）
         """
         prompt = event.message_str.strip()
         if not prompt:
@@ -338,34 +334,85 @@ class GeminiImagePlugin(Star):
             )
             return
 
-        # 获取图片数据
-        image_data, mime_type = await self._get_reference_image(event)
-        mode = "图生图" if image_data else "文生图"
+        # 获取参考图片列表
+        images_data = await self._get_reference_images_for_tool(event, num_cached_images=3)
+        mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
         yield event.plain_result(f"已开始{mode}任务")
 
         # 创建异步任务,在后台生成图片
         self.create_background_task(
             self._generate_and_send_image_async(
                 prompt=prompt,
-                image_data=image_data,
-                mime_type=mime_type,
+                images_data=images_data or None,
                 unified_msg_origin=event.unified_msg_origin,
-                use_reference_image=image_data is not None,
                 aspect_ratio=self.default_aspect_ratio,
                 resolution=self.default_resolution,
             )
         )
 
-    async def _get_reference_image(
-        self, event: AstrMessageEvent
-    ) -> tuple[bytes | None, str | None]:
-        """获取参考图片（优先从消息中获取，失败则从缓存获取）"""
-        for component in event.message_obj.message:
-            if isinstance(component, Comp.Image) and (result := await self._download_image(component.url or component.file)):
-                return result
+    async def _get_reference_images_for_tool(
+        self, event: AstrMessageEvent, num_cached_images: int = 0
+    ) -> list[tuple[bytes, str]]:
+        """获取参考图片列表（用于工具调用）
 
-        recent_images = self.get_recent_images(event.unified_msg_origin)
-        return await self._download_image(recent_images[0]["url"]) if recent_images else (None, None)
+        Args:
+            event: 消息事件
+            num_cached_images: 使用缓存图片的数量（当消息中没有图片时），0表示不使用缓存
+
+        Returns:
+            参考图片列表，每个元素为 (image_data, mime_type) 元组
+        """
+        images_data = []
+        message_chain = event.message_obj.message
+
+        # 优先处理引用消息中的图片（避免对话中其他图片的干扰）
+        for component in message_chain:
+            if isinstance(component, Comp.Reply):
+                logger.debug("[Gemini Image] 检测到引用消息，尝试解析被引用的图片")
+
+                source_chain = None
+                # 尝试从不同的属性中获取引用消息的内容
+                if hasattr(component, "chain") and isinstance(component.chain, list):
+                    source_chain = component.chain
+                    logger.debug("[Gemini Image] Reply 组件有 'chain' 属性")
+                elif hasattr(component, "message") and isinstance(component.message, list):
+                    source_chain = component.message
+                    logger.debug("[Gemini Image] Reply 组件有 'message' 属性")
+                elif hasattr(component, "source") and hasattr(component.source, "message_chain") and isinstance(component.source.message_chain, list):
+                    source_chain = component.source.message_chain
+                    logger.debug("[Gemini Image] Reply 组件有 'source.message_chain' 属性")
+
+                # 从引用消息中提取所有图片
+                if source_chain:
+                    for replied_part in source_chain:
+                        if isinstance(replied_part, Comp.Image) and hasattr(replied_part, "url") and replied_part.url:
+                            if result := await self._download_image(replied_part.url):
+                                images_data.append(result)
+                                logger.info("[Gemini Image] 成功从引用消息中加载图片")
+
+                # 如果找到了引用消息中的图片，直接返回，不再处理当前消息中的图片
+                if images_data:
+                    logger.info(f"[Gemini Image] 使用引用消息中的 {len(images_data)} 张图片作为参考")
+                    return images_data
+
+        # 如果没有引用消息或引用消息中没有图片，则从当前消息中获取所有图片
+        for component in message_chain:
+            if isinstance(component, Comp.Image):
+                if result := await self._download_image(component.url or component.file):
+                    images_data.append(result)
+
+        # 如果当前消息中也没有图片，且指定了缓存数量，则从缓存获取指定数量的最新图片
+        if not images_data and num_cached_images > 0:
+            recent_images = self.get_recent_images(event.unified_msg_origin)
+            if recent_images:
+                # 获取指定数量的最新图片
+                for img_info in recent_images[:num_cached_images]:
+                    if result := await self._download_image(img_info["url"]):
+                        images_data.append(result)
+                if images_data:
+                    logger.info(f"[Gemini Image] 从缓存中获取 {len(images_data)} 张参考图片")
+
+        return images_data
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -374,7 +421,7 @@ class GeminiImagePlugin(Star):
             if isinstance(component, Comp.Image):
                 image_url = component.url or component.file
                 if image_url:
-                    self._remember_user_image_url(
+                    self._remember_image_url(
                         event.unified_msg_origin, image_url, "image/png"
                     )
 
@@ -412,17 +459,14 @@ class GeminiImagePlugin(Star):
         task.add_done_callback(self.background_tasks.discard)
         return task
 
-    async def _download_image_from_component(self, component: Comp.Image) -> tuple[bytes, str] | None:
-        """从消息组件下载图片"""
-        return await self._download_image(component.url or component.file)
-
     async def _download_image(self, image_url: str | None) -> tuple[bytes, str] | None:
         """下载图片并返回数据与 MIME 类型"""
         if not image_url:
             return None
 
         try:
-            async with aiohttp.ClientSession() as session, session.get(image_url) as resp:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session, session.get(image_url) as resp:
                 if resp.status != 200:
                     logger.error(f"[Gemini Image] 下载图片失败: {resp.status} - {image_url}")
                     return None
@@ -440,8 +484,14 @@ class GeminiImagePlugin(Star):
             logger.error(f"[Gemini Image] 下载图片时出错: {exc}")
             return None
 
-    def _remember_user_image_url(self, session_id: str, image_url: str, mime_type: str | None) -> None:
-        """缓存用户发送的图片 URL（而非完整数据，节省内存）"""
+    def _remember_image_url(self, session_id: str, image_url: str, mime_type: str | None) -> None:
+        """缓存图片 URL（而非完整数据，节省内存）
+
+        Args:
+            session_id: 会话ID
+            image_url: 图片URL
+            mime_type: MIME类型
+        """
         session_images = self.recent_images.setdefault(session_id, [])
         session_images.insert(0, {
             "url": image_url,
@@ -452,7 +502,7 @@ class GeminiImagePlugin(Star):
         if len(session_images) > self.max_images_per_session:
             del session_images[self.max_images_per_session:]
 
-        logger.info(f"[Gemini Image] 已缓存用户图片 URL，会话 {session_id} 当前有 {len(session_images)} 张图片")
+        logger.info(f"[Gemini Image] 已缓存图片 URL，会话 {session_id} 当前有 {len(session_images)} 张图片")
 
         self._cache_counter = getattr(self, "_cache_counter", 0) + 1
         if self._cache_counter >= 10:
@@ -463,21 +513,26 @@ class GeminiImagePlugin(Star):
         self,
         prompt: str,
         unified_msg_origin: str,
-        image_data: bytes | None = None,
-        mime_type: str | None = None,
-        use_reference_image: bool = False,
+        images_data: list[tuple[bytes, str]] | None = None,
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
     ):
-        """异步生成图片并发送给用户"""
+        """异步生成图片并发送给用户
+
+        Args:
+            prompt: 生成提示词
+            unified_msg_origin: 消息来源
+            images_data: 参考图片列表，每个元素为 (image_data, mime_type) 元组
+            aspect_ratio: 宽高比
+            resolution: 分辨率
+        """
         async with self._generation_semaphore:
             try:
                 logger.info(f"[Gemini Image] 开始异步生成任务，会话: {unified_msg_origin}，提示词: {prompt[:50]}...")
 
                 result_data, error = await self.generator.generate_image(
                     prompt=prompt,
-                    image_data=image_data,
-                    mime_type=mime_type,
+                    images_data=images_data,
                     aspect_ratio=aspect_ratio,
                     image_size=resolution,
                 )
@@ -492,7 +547,12 @@ class GeminiImagePlugin(Star):
                     unified_msg_origin, MessageChain().file_image(str(file_path))
                 )
 
-                logger.info(f"[Gemini Image] {'图生图' if use_reference_image else '文生图'}任务完成，已发送给用户")
+                # 缓存 bot 生成的图片路径（使用 file:// 协议）
+                file_url = f"file://{file_path.as_posix()}" if hasattr(file_path, "as_posix") else f"file://{file_path}"
+                self._remember_image_url(unified_msg_origin, file_url, "image/png")
+
+                mode = "图生图" if images_data else "文生图"
+                logger.info(f"[Gemini Image] {mode}任务完成，已发送给用户")
 
             except Exception as e:
                 logger.error(f"[Gemini Image] 异步生成任务失败: {e}", exc_info=True)
