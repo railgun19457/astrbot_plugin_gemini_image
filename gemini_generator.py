@@ -134,6 +134,7 @@ class GeminiImageGenerator:
         images_data: list[tuple[bytes, str]] | None = None,
         aspect_ratio: str = "1:1",
         image_size: str | None = None,
+        task_id: str | None = None,
     ) -> tuple[bytes | None, str | None]:
         """统一的图像生成接口，支持文生图和图生图（支持多张参考图片）
 
@@ -142,6 +143,7 @@ class GeminiImageGenerator:
             images_data: 参考图片列表，每个元素为 (image_data, mime_type) 元组
             aspect_ratio: 宽高比
             image_size: 图片尺寸
+            task_id: 任务ID，用于日志追踪
 
         Returns:
             (生成的图片数据, 错误信息) 元组
@@ -160,7 +162,7 @@ class GeminiImageGenerator:
         result = (None, "未配置 API Key")
         for attempt in range(len(self.api_keys)):
             result = await self._try_generate_with_current_key(
-                prompt, converted_images, aspect_ratio, image_size
+                prompt, converted_images, aspect_ratio, image_size, task_id
             )
 
             if result[0] is not None:  # 成功
@@ -178,37 +180,44 @@ class GeminiImageGenerator:
         images_data: list[tuple[bytes, str]],
         aspect_ratio: str,
         image_size: str | None,
+        task_id: str | None = None,
     ) -> tuple[bytes | None, str | None]:
         """使用当前 API Key 尝试生成图片"""
+        prefix = f"[{task_id}] " if task_id else ""
+        start_time = time.time()
+
         try:
             payload = self._build_request_payload(
                 prompt, images_data, aspect_ratio, image_size
             )
 
             mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
-            logger.info(
-                f"[Gemini Image] 开始{mode}，提示词: {prompt[:50]}... (Key 索引: {self.current_key_index})"
+            logger.debug(
+                f"[Gemini Image] {prefix}开始{mode} (Key 索引: {self.current_key_index})"
             )
 
             async with aiohttp.ClientSession() as session:
-                response_data = await self._make_api_request(session, payload)
+                response_data = await self._make_api_request(session, payload, task_id)
                 if response_data is None:
                     return None, "API 请求失败"
 
                 # 解析响应获取图片数据
-                result_image_data = self._extract_image_from_response(response_data)
+                result_image_data = self._extract_image_from_response(response_data, task_id)
                 if result_image_data:
-                    logger.info(f"[Gemini Image] {mode}成功")
+                    elapsed = time.time() - start_time
+                    logger.debug(f"[Gemini Image] {prefix}API 请求成功，耗时: {elapsed:.2f}s")
                     return result_image_data, None
 
-                logger.error("[Gemini Image] 响应中未找到图片数据")
+                logger.error(f"[Gemini Image] {prefix}响应中未找到图片数据")
                 return None, "响应中未找到图片数据"
 
         except asyncio.TimeoutError:
-            logger.error("[Gemini Image] 生成超时")
+            elapsed = time.time() - start_time
+            logger.error(f"[Gemini Image] {prefix}生成超时，耗时: {elapsed:.2f}s")
             return None, "生成超时"
         except Exception as e:
-            logger.error(f"[Gemini Image] 生成失败: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"[Gemini Image] {prefix}生成失败，耗时: {elapsed:.2f}s，错误: {e}")
             return None, f"生成失败: {str(e)}"
 
     def _build_request_payload(
@@ -264,17 +273,17 @@ class GeminiImageGenerator:
         }
 
     async def _make_api_request(
-        self, session: aiohttp.ClientSession, payload: dict
+        self, session: aiohttp.ClientSession, payload: dict, task_id: str | None = None
     ) -> dict | None:
         """发送 API 请求并处理响应"""
+        prefix = f"[{task_id}] " if task_id else ""
         url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self._get_current_api_key(),
         }
 
-        # 调试：打印实际请求信息
-        logger.info(f"[Gemini Image] 请求 URL: {url}")
+        logger.debug(f"[Gemini Image] {prefix}请求 URL: {url}")
 
         async with session.post(
             url,
@@ -284,66 +293,70 @@ class GeminiImageGenerator:
         ) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"[Gemini Image] API 错误: {response.status} - {error_text}")
+                # 截断过长的错误信息
+                error_preview = error_text[:500] + "..." if len(error_text) > 500 else error_text
+                logger.error(f"[Gemini Image] {prefix}API 错误: {response.status} - {error_preview}")
 
                 # 如果是认证错误或配额错误，尝试下一个 key
                 if response.status in [401, 403, 429] and len(self.api_keys) > 1:
                     logger.warning(
-                        f"[Gemini Image] Key 失败，尝试下一个 (错误: {response.status})"
+                        f"[Gemini Image] {prefix}Key 失败，尝试下一个 (错误: {response.status})"
                     )
                 return None
 
             return await response.json()
 
-    def _extract_image_from_response(self, response: dict) -> bytes | None:
+    def _extract_image_from_response(self, response: dict, task_id: str | None = None) -> bytes | None:
         """从 API 响应中提取图片数据"""
+        prefix = f"[{task_id}] " if task_id else ""
         try:
             candidates = response.get("candidates", [])
-            logger.debug(f"[Gemini Image] 解析响应: 找到 {len(candidates)} 个候选结果")
+            logger.debug(f"[Gemini Image] {prefix}解析响应: 找到 {len(candidates)} 个候选结果")
 
             if not candidates:
-                logger.warning("[Gemini Image] 响应中没有 candidates")
+                logger.warning(f"[Gemini Image] {prefix}响应中没有 candidates")
                 return None
 
             parts = candidates[0].get("content", {}).get("parts", [])
-            logger.debug(f"[Gemini Image] 找到 {len(parts)} 个 parts")
+            logger.debug(f"[Gemini Image] {prefix}找到 {len(parts)} 个 parts")
 
             # 收集所有图片
             images = []
             for i, part in enumerate(parts):
-                image_data = self._extract_image_from_part(part, i)
+                image_data = self._extract_image_from_part(part, i, task_id)
                 if image_data:
                     images.append(image_data)
 
             if images:
-                logger.debug(f"[Gemini Image] 返回 {len(images)} 张图片中的最后一张")
+                logger.debug(f"[Gemini Image] {prefix}返回 {len(images)} 张图片中的最后一张")
                 return images[-1]
 
-            logger.debug("[Gemini Image] 未找到任何图片")
+            logger.debug(f"[Gemini Image] {prefix}未找到任何图片")
             return None
 
         except Exception as e:
-            logger.error(f"[Gemini Image] 解析响应失败: {e}")
+            logger.error(f"[Gemini Image] {prefix}解析响应失败: {e}")
             return None
 
-    def _extract_image_from_part(self, part: dict, index: int) -> bytes | None:
+    def _extract_image_from_part(self, part: dict, index: int, task_id: str | None = None) -> bytes | None:
         """从单个 part 中提取图片数据"""
+        prefix = f"[{task_id}] " if task_id else ""
         inline_data = part.get("inline_data") or part.get("inlineData")
         if not inline_data:
-            logger.debug(f"[Gemini Image] part {index} 没有 inline_data")
+            logger.debug(f"[Gemini Image] {prefix}part {index} 没有 inline_data")
             return None
 
         mime_type = inline_data.get("mime_type") or inline_data.get("mimeType", "")
         if not mime_type.startswith("image/"):
-            logger.debug(f"[Gemini Image] 跳过非图片类型 part {index}")
+            logger.debug(f"[Gemini Image] {prefix}跳过非图片类型 part {index}")
             return None
 
         image_base64 = inline_data.get("data", "")
         if not image_base64:
-            logger.warning(f"[Gemini Image] part {index} 没有图片数据")
+            logger.warning(f"[Gemini Image] {prefix}part {index} 没有图片数据")
             return None
 
-        logger.debug(f"[Gemini Image] 找到图片数据，长度: {len(image_base64)} 字符")
+        logger.debug(f"[Gemini Image] {prefix}找到图片数据，长度: {len(image_base64)} 字符")
         return base64.b64decode(image_base64)
 
     async def cache_image(
@@ -378,7 +391,7 @@ class GeminiImageGenerator:
         # 检查缓存数量
         await self._check_cache_limit()
 
-        logger.info(f"[Gemini Image] 图片已缓存: {file_path}")
+        logger.debug(f"[Gemini Image] 图片已缓存: {file_path}")
         return file_path
 
     async def _check_cache_limit(self):

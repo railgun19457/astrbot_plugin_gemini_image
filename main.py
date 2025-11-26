@@ -392,7 +392,8 @@ class GeminiImagePlugin(Star):
         # 检查是否使用预设
         if user_input in self.presets:
             prompt = self.presets[user_input]
-            logger.info(f"[Gemini Image] 使用预设 '{user_input}': {prompt[:50]}...")
+            logger.info(f"[Gemini Image] 会话 {event.unified_msg_origin} 使用预设 '{user_input}'")
+            logger.debug(f"[Gemini Image] 预设内容: {prompt}")
         else:
             # 不是预设，直接使用用户输入作为提示词
             prompt = user_input
@@ -456,7 +457,7 @@ class GeminiImagePlugin(Star):
                         if isinstance(replied_part, Comp.Image) and hasattr(replied_part, "url") and replied_part.url:
                             if result := await self._download_image(replied_part.url):
                                 images_data.append(result)
-                                logger.info("[Gemini Image] 成功从引用消息中加载图片")
+                                logger.debug("[Gemini Image] 成功从引用消息中加载图片")
 
                 # 如果找到了引用消息中的图片，直接返回，不再处理当前消息中的图片
                 if images_data:
@@ -478,7 +479,7 @@ class GeminiImagePlugin(Star):
                     if result := await self._download_image(img_info["url"]):
                         images_data.append(result)
                 if images_data:
-                    logger.info(f"[Gemini Image] 从缓存中获取 {len(images_data)} 张参考图片")
+                    logger.debug(f"[Gemini Image] 从缓存中获取 {len(images_data)} 张参考图片")
 
         return images_data
 
@@ -545,7 +546,7 @@ class GeminiImagePlugin(Star):
                     return None
 
                 mime_type = resp.headers.get("Content-Type", "image/png")
-                logger.info(f"[Gemini Image] 下载图片成功: {len(image_data)} bytes, MIME: {mime_type}")
+                logger.debug(f"[Gemini Image] 下载图片成功: {len(image_data)} bytes, MIME: {mime_type}")
                 return image_data, mime_type
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -570,7 +571,7 @@ class GeminiImagePlugin(Star):
         if len(session_images) > self.max_images_per_session:
             del session_images[self.max_images_per_session:]
 
-        logger.info(f"[Gemini Image] 已缓存图片 URL，会话 {session_id} 当前有 {len(session_images)} 张图片")
+        logger.debug(f"[Gemini Image] 已缓存图片 URL，会话 {session_id} 当前有 {len(session_images)} 张图片")
 
         self._cache_counter = getattr(self, "_cache_counter", 0) + 1
         if self._cache_counter >= 10:
@@ -594,18 +595,26 @@ class GeminiImagePlugin(Star):
             aspect_ratio: 宽高比
             resolution: 分辨率
         """
+        task_id = hashlib.md5(f"{time.time()}{unified_msg_origin}".encode()).hexdigest()[:8]
+        start_time = time.time()
+
         async with self._generation_semaphore:
             try:
-                logger.info(f"[Gemini Image] 开始异步生成任务，会话: {unified_msg_origin}，提示词: {prompt[:50]}...")
+                mode = "图生图" if images_data else "文生图"
+                logger.info(f"[Gemini Image] [{task_id}] 开始{mode}任务，会话: {unified_msg_origin}")
+                logger.debug(f"[Gemini Image] [{task_id}] 提示词: {prompt}")
 
                 result_data, error = await self.generator.generate_image(
                     prompt=prompt,
                     images_data=images_data,
                     aspect_ratio=aspect_ratio,
                     image_size=resolution,
+                    task_id=task_id,
                 )
 
                 if error:
+                    elapsed = time.time() - start_time
+                    logger.warning(f"[Gemini Image] [{task_id}] {mode}任务失败，耗时: {elapsed:.2f}s")
                     await self._send_error_message(unified_msg_origin, error)
                     return
 
@@ -619,11 +628,12 @@ class GeminiImagePlugin(Star):
                 file_url = f"file://{file_path.as_posix()}" if hasattr(file_path, "as_posix") else f"file://{file_path}"
                 self._remember_image_url(unified_msg_origin, file_url, "image/png")
 
-                mode = "图生图" if images_data else "文生图"
-                logger.info(f"[Gemini Image] {mode}任务完成，已发送给用户")
+                elapsed = time.time() - start_time
+                logger.info(f"[Gemini Image] [{task_id}] {mode}任务完成，耗时: {elapsed:.2f}s")
 
             except Exception as e:
-                logger.error(f"[Gemini Image] 异步生成任务失败: {e}", exc_info=True)
+                elapsed = time.time() - start_time
+                logger.error(f"[Gemini Image] [{task_id}] 异步生成任务失败，耗时: {elapsed:.2f}s，错误: {e}", exc_info=True)
                 await self._send_error_message(
                     unified_msg_origin, "图片生成过程中发生未知错误，请稍后重试或联系管理员"
                 )
