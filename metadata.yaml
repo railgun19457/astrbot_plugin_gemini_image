@@ -1,6 +1,6 @@
 name: astrbot_plugin_gemini_image
 display_name: Gemini生图
 desc: 基于 Gemini 模型的图像生成插件，支持文生图和图生图，支持自然语言调用和预设提示词
-version: v1.0
+version: v1.1
 author: Railgun19457
 repo: https://github.com/railgun19457/astrbot_plugin_gemini_image

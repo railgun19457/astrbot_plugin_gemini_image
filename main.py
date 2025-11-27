@@ -39,7 +39,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "生图时使用的提示词(直接将用户的要求翻译为英文)",
+                    "description": "生图时使用的提示词(直接将用户发送的内容原样传递给模型)",
                 },
                 "aspect_ratio": {
                     "type": "string",
@@ -140,6 +140,14 @@ class GeminiImagePlugin(Star):
     MAX_CONCURRENT_GENERATIONS = 10  # 最大并发生成数
     MAX_IMAGES_PER_SESSION = 3  # 每会话最大图片数（硬编码，仅作为备用）
     IMAGE_CACHE_TTL = 3600  # 图片缓存过期时间 (秒)
+
+    # 可用模型列表
+    AVAILABLE_MODELS = [
+        "gemini-2.0-flash-exp-image-generation",
+        "gemini-2.5-flash-image",
+        "gemini-2.5-flash-image-preview",
+        "gemini-3-pro-image-preview",
+    ]
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -378,6 +386,7 @@ class GeminiImagePlugin(Star):
         用法:
         /生图 <提示词或预设名称> - 文生图
         /生图 <提示词或预设名称> (引用包含图片的消息) - 图生图（支持多张图片）
+        /生图 <提示词或预设名称> @用户 - 使用被@用户的头像作为参考图
         """
         user_input = event.message_str.strip()
 
@@ -411,6 +420,28 @@ class GeminiImagePlugin(Star):
 
         # 获取参考图片列表
         images_data = await self._get_reference_images_for_tool(event, num_cached_images=3)
+
+        # 检查消息中是否包含 @ 信息，获取被@用户的头像
+        self_id = str(event.get_sender_id())
+        target_id = next(
+            (
+                str(seg.qq)
+                for seg in event.get_messages()
+                if isinstance(seg, Comp.At) and str(seg.qq) != self_id
+            ),
+            None,
+        )
+
+        # 如果找到被@的用户，下载其头像作为参考图
+        if target_id:
+            logger.info(f"[Gemini Image] 检测到@用户 {target_id}，正在下载头像作为参考图")
+            avatar_data = await self.get_avatar(target_id)
+            if avatar_data:
+                images_data.append((avatar_data, "image/jpeg"))
+                logger.info(f"[Gemini Image] 成功添加用户 {target_id} 的头像作为参考图")
+            else:
+                logger.warning(f"[Gemini Image] 下载用户 {target_id} 的头像失败")
+
         mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
 
         # 如果使用了预设，在提示中显示预设名称
@@ -429,6 +460,147 @@ class GeminiImagePlugin(Star):
                 resolution=self.default_resolution,
             )
         )
+
+    @filter.command("生图模型")
+    async def model_command(self, event: AstrMessageEvent):
+        """生图模型管理指令
+
+        用法:
+        /生图模型 - 显示可用模型列表和当前使用的模型
+        /生图模型 <序号> - 切换到指定序号的模型
+        """
+        user_input = event.message_str.strip()
+
+        # 移除指令名称
+        if user_input.startswith("生图模型 "):
+            user_input = user_input[5:].strip()
+        elif user_input == "生图模型":
+            user_input = ""
+
+        # 如果没有参数，显示模型列表
+        if not user_input:
+            model_list = "📋 可用模型列表:\n\n"
+            for idx, model in enumerate(self.AVAILABLE_MODELS, 1):
+                current_marker = " ✓" if model == self.model else ""
+                model_list += f"{idx}. {model}{current_marker}\n"
+
+            model_list += f"\n当前使用: {self.model}"
+            model_list += "\n\n💡 使用 /生图模型 <序号> 切换模型"
+
+            yield event.plain_result(model_list)
+            return
+
+        # 如果有参数，尝试切换模型
+        try:
+            model_index = int(user_input) - 1
+            if 0 <= model_index < len(self.AVAILABLE_MODELS):
+                new_model = self.AVAILABLE_MODELS[model_index]
+                old_model = self.model
+
+                # 更新模型
+                self.model = new_model
+                self.generator.model = new_model
+
+                # 保存到配置文件
+                self.config["model"] = new_model
+                self.config.save_config()
+
+                logger.info(f"[Gemini Image] 模型已从 {old_model} 切换到 {new_model}")
+                yield event.plain_result(f"✅ 模型已切换: {new_model}")
+            else:
+                yield event.plain_result(f"❌ 无效的序号！请输入 1-{len(self.AVAILABLE_MODELS)} 之间的数字")
+        except ValueError:
+            yield event.plain_result("❌ 请输入有效的数字序号")
+
+    @filter.command("预设")
+    async def preset_command(self, event: AstrMessageEvent):
+        """预设管理指令
+
+        用法:
+        /预设 - 显示所有预设
+        /预设 添加 <预设名:预设内容> - 添加新预设
+        /预设 删除 <预设名> - 删除指定预设
+        """
+        user_input = event.message_str.strip()
+
+        # 移除指令名称
+        if user_input.startswith("预设 "):
+            user_input = user_input[3:].strip()
+        elif user_input == "预设":
+            user_input = ""
+
+        # 如果没有参数，显示预设列表
+        if not user_input:
+            if not self.presets:
+                yield event.plain_result("📋 当前没有预设\n\n💡 使用 /预设 添加 <预设名:预设内容> 来添加预设")
+                return
+
+            preset_list = "📋 预设列表:\n\n"
+            for idx, (name, prompt) in enumerate(self.presets.items(), 1):
+                # 截断过长的提示词
+                display_prompt = prompt if len(prompt) <= 50 else prompt[:47] + "..."
+                preset_list += f"{idx}. {name}: {display_prompt}\n"
+
+            preset_list += "\n💡 使用方法:\n• /预设 添加 <预设名:预设内容>\n• /预设 删除 <预设名>"
+
+            yield event.plain_result(preset_list)
+            return
+
+        # 处理"添加"子命令
+        if user_input.startswith("添加 "):
+            preset_str = user_input[3:].strip()
+
+            if ":" not in preset_str:
+                yield event.plain_result("❌ 格式错误！正确格式: /预设 添加 <预设名:预设内容>")
+                return
+
+            # 分割预设名和内容
+            name, prompt = preset_str.split(":", 1)
+            name = name.strip()
+            prompt = prompt.strip()
+
+            if not name or not prompt:
+                yield event.plain_result("❌ 预设名和预设内容不能为空")
+                return
+
+            # 添加预设
+            self.presets[name] = prompt
+
+            # 保存到配置文件
+            presets_config = [f"{k}:{v}" for k, v in self.presets.items()]
+            self.config["presets"] = presets_config
+            self.config.save_config()
+
+            logger.info(f"[Gemini Image] 添加预设: {name}")
+            yield event.plain_result(f"✅ 预设已添加: {name}")
+            return
+
+        # 处理"删除"子命令
+        if user_input.startswith("删除 "):
+            preset_name = user_input[3:].strip()
+
+            if not preset_name:
+                yield event.plain_result("❌ 请指定要删除的预设名")
+                return
+
+            if preset_name not in self.presets:
+                yield event.plain_result(f"❌ 预设不存在: {preset_name}")
+                return
+
+            # 删除预设
+            del self.presets[preset_name]
+
+            # 保存到配置文件
+            presets_config = [f"{k}:{v}" for k, v in self.presets.items()]
+            self.config["presets"] = presets_config
+            self.config.save_config()
+
+            logger.info(f"[Gemini Image] 删除预设: {preset_name}")
+            yield event.plain_result(f"✅ 预设已删除: {preset_name}")
+            return
+
+        # 未知子命令
+        yield event.plain_result("❌ 未知命令\n\n💡 使用方法:\n• /预设 - 显示所有预设\n• /预设 添加 <预设名:预设内容>\n• /预设 删除 <预设名>")
 
     def _get_reply_message_chain(self, reply_component: Comp.Reply) -> list | None:
         """从 Reply 组件中获取被引用的消息链
@@ -595,6 +767,26 @@ class GeminiImagePlugin(Star):
             await self._download_session.close()
             self._download_session = None
 
+    @staticmethod
+    async def get_avatar(user_id: str) -> bytes | None:
+        """下载QQ用户头像
+
+        Args:
+            user_id: QQ用户ID
+
+        Returns:
+            头像数据，失败返回 None
+        """
+        avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
+        try:
+            async with aiohttp.ClientSession() as client:
+                response = await client.get(avatar_url)
+                response.raise_for_status()
+                return await response.read()
+        except Exception as e:
+            logger.error(f"[Gemini Image] 下载头像失败: {e}")
+            return None
+
     async def _download_image(self, image_url: str | None) -> tuple[bytes, str] | None:
         """下载图片并返回数据与 MIME 类型"""
         if not image_url:
@@ -702,7 +894,7 @@ class GeminiImagePlugin(Star):
 
     async def _send_error_message(self, unified_msg_origin: str, error: str):
         """发送错误消息"""
-        error_msg = f"❌ 图片生成失败: {error}\n\n💡 可能的原因:\n• 提示词描述过于复杂\n• API 服务暂时不可用\n• 请稍后重试"
+        error_msg = f"❌ 图片生成失败: {error}"
         logger.error(f"[Gemini Image] {error_msg}")
         try:
             await self.context.send_message(unified_msg_origin, MessageChain().message(error_msg))
