@@ -171,6 +171,7 @@ class GeminiImagePlugin(Star):
             timeout=self.timeout,
             cache_ttl=self.cache_ttl,
             max_cache_count=self.max_cache_count,
+            max_retry_attempts=self.max_retry_attempts,
         )
 
         # 存储最近收到的图片 {session_id: [{"url": str, "mime_type": str, "timestamp": float}]}
@@ -213,6 +214,7 @@ class GeminiImagePlugin(Star):
         self.enable_llm_tool = self.config.get("enable_llm_tool", True)
         self.default_aspect_ratio = self.config.get("default_aspect_ratio", "1:1")
         self.default_resolution = self.config.get("default_resolution", "1K")
+        self.max_retry_attempts = self.config.get("max_retry_attempts", 3)
         self.presets = self._load_presets()
         self._validate_config()
 
@@ -341,6 +343,12 @@ class GeminiImagePlugin(Star):
             self.config.get("max_concurrent_generations", self.DEFAULT_MAX_CONCURRENT_GENERATIONS),
             "并发生成数", 0, self.MAX_CONCURRENT_GENERATIONS, self.DEFAULT_MAX_CONCURRENT_GENERATIONS
         )
+
+        # 验证重试次数
+        self.max_retry_attempts = int(self._validate_numeric_config(
+            self.max_retry_attempts,
+            "重试次数", 0, 10, 3
+        ))
 
         # 验证默认宽高比和分辨率
         if self.default_aspect_ratio not in ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]:
@@ -689,7 +697,7 @@ class GeminiImagePlugin(Star):
                 # 获取引用消息的消息链（标准属性是 chain）
                 source_chain = self._get_reply_message_chain(component)
 
-                # 从引用消息中提取所有图片
+                # 从引用消息中提取所有图片（排除头像）
                 if source_chain:
                     for replied_part in source_chain:
                         if isinstance(replied_part, Comp.Image) and hasattr(replied_part, "url") and replied_part.url:

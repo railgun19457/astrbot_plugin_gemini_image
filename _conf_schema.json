@@ -114,6 +114,12 @@
     "type": "int",
     "default": 10
   },
+  "max_retry_attempts": {
+    "description": "生图失败重试次数",
+    "hint": "当图片生成失败时，自动重试的最大次数（默认3次）",
+    "type": "int",
+    "default": 3
+  },
   "presets": {
     "description": "预设提示词",
     "hint": "预定义的图片生成提示词模板，格式为 '名称:提示词'，每行一个预设。使用 /生图 <预设名称> 快速生成图片",

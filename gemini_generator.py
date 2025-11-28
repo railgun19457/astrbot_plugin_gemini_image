@@ -48,6 +48,7 @@ class GeminiImageGenerator:
         cache_dir: Path | None = None,
         cache_ttl: int = 3600,
         max_cache_count: int = 100,
+        max_retry_attempts: int = 3,
     ):
         """
         初始化 Gemini 图像生成器
@@ -60,6 +61,7 @@ class GeminiImageGenerator:
             cache_dir: 图片缓存目录
             cache_ttl: 缓存过期时间（秒）
             max_cache_count: 最大缓存数量
+            max_retry_attempts: 生成失败时的最大重试次数
         """
         self.api_keys = api_keys if api_keys else []
         self.current_key_index = 0
@@ -69,6 +71,7 @@ class GeminiImageGenerator:
         self.cache_dir = cache_dir or Path("data/temp/gemini_images")
         self.cache_ttl = cache_ttl
         self.max_cache_count = max_cache_count
+        self.max_retry_attempts = max(1, min(max_retry_attempts, 10))  # 限制在 1-10 次之间
 
         # 确保缓存目录存在
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +161,7 @@ class GeminiImageGenerator:
         image_size: str | None = None,
         task_id: str | None = None,
     ) -> tuple[bytes | None, str | None]:
-        """统一的图像生成接口，支持文生图和图生图（支持多张参考图片）
+        """统一的图像生成接口，支持文生图和图生图（支持多张参考图片），带重试机制
 
         Args:
             prompt: 生成提示词
@@ -173,6 +176,8 @@ class GeminiImageGenerator:
         if not self.api_keys:
             return None, "未配置 API Key"
 
+        prefix = f"[{task_id}] " if task_id else ""
+
         # 转换所有图片格式（如果需要）
         converted_images = []
         if images_data:
@@ -180,21 +185,44 @@ class GeminiImageGenerator:
                 converted_data, converted_mime = await self._convert_image_format(image_data, mime_type)
                 converted_images.append((converted_data, converted_mime))
 
-        # 尝试所有可用的 API Key
-        result = (None, "未配置 API Key")
-        for attempt in range(len(self.api_keys)):
-            result = await self._try_generate_with_current_key(
-                prompt, converted_images, aspect_ratio, image_size, task_id
-            )
+        # 重试机制：对每个 API Key 进行多次重试
+        last_error = "未配置 API Key"
 
-            if result[0] is not None:  # 成功
-                return result
+        for retry_attempt in range(self.max_retry_attempts):
+            # 尝试所有可用的 API Key
+            for key_attempt in range(len(self.api_keys)):
+                if retry_attempt > 0 or key_attempt > 0:
+                    logger.info(
+                        f"[Gemini Image] {prefix}重试生成 (第 {retry_attempt + 1}/{self.max_retry_attempts} 次重试, "
+                        f"Key 索引: {self.current_key_index})"
+                    )
 
-            # 如果有多个 key 且不是最后一次尝试，切换到下一个 key
-            if len(self.api_keys) > 1 and attempt < len(self.api_keys) - 1:
-                self._rotate_api_key()
+                result = await self._try_generate_with_current_key(
+                    prompt, converted_images, aspect_ratio, image_size, task_id
+                )
 
-        return None, result[1] or "所有 API Key 都失败了"
+                if result[0] is not None:  # 成功
+                    if retry_attempt > 0:
+                        logger.info(f"[Gemini Image] {prefix}重试成功！")
+                    return result
+
+                last_error = result[1] or "生成失败"
+
+                # 如果有多个 key 且不是最后一次尝试，切换到下一个 key
+                if len(self.api_keys) > 1 and key_attempt < len(self.api_keys) - 1:
+                    self._rotate_api_key()
+
+            # 如果不是最后一次重试，等待一小段时间后再重试
+            if retry_attempt < self.max_retry_attempts - 1:
+                wait_time = min(2 ** retry_attempt, 10)  # 指数退避，最多等待10秒
+                logger.info(f"[Gemini Image] {prefix}等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
+
+        logger.error(
+            f"[Gemini Image] {prefix}所有重试均失败 "
+            f"(共 {self.max_retry_attempts} 次重试 × {len(self.api_keys)} 个 Key)"
+        )
+        return None, f"重试 {self.max_retry_attempts} 次后仍然失败: {last_error}"
 
     async def _try_generate_with_current_key(
         self,
