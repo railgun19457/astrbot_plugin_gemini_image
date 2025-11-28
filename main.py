@@ -402,15 +402,26 @@ class GeminiImagePlugin(Star):
         /生图 <提示词或预设名称> (引用包含图片的消息) - 图生图（支持多张图片）
         /生图 <提示词或预设名称> @用户 - 使用被@用户的头像作为参考图
         """
-        # 从消息链中提取纯文本（排除 At 组件）和被@的用户
+        # 从消息链中提取纯文本（排除 At 组件）、被@的用户和被引用用户ID
         text_parts = []
         at_users = []
+        replied_user_id = None
 
         for seg in event.get_messages():
             if isinstance(seg, Comp.Plain):
                 text_parts.append(seg.text)
             elif isinstance(seg, Comp.At):
                 at_users.append(str(seg.qq))
+            elif isinstance(seg, Comp.Reply):
+                # 获取被引用用户的ID（尝试多个可能的属性）
+                replied_user_id = (
+                    getattr(seg, "user_id", None) or
+                    getattr(seg, "sender_id", None) or
+                    getattr(seg, "qq", None)
+                )
+                if replied_user_id:
+                    replied_user_id = str(replied_user_id)
+                    logger.debug(f"[Gemini Image] 检测到引用消息，被引用用户ID: {replied_user_id}")
 
         # 合并纯文本
         user_input = "".join(text_parts).strip()
@@ -457,16 +468,23 @@ class GeminiImagePlugin(Star):
         # 获取参考图片列表（指令生图不使用缓存，只从当前消息获取）
         images_data = await self._get_reference_images_for_tool(event, num_cached_images=0)
 
-        # 下载所有被@用户的头像作为参考图
+        # 下载所有被@用户的头像作为参考图（排除被引用用户）
         if at_users:
-            logger.info(f"[Gemini Image] 检测到 {len(at_users)} 个@用户，正在下载头像作为参考图")
-            for target_id in at_users:
-                avatar_data = await self.get_avatar(target_id)
-                if avatar_data:
-                    images_data.append((avatar_data, "image/jpeg"))
-                    logger.info(f"[Gemini Image] 成功添加用户 {target_id} 的头像作为参考图")
-                else:
-                    logger.warning(f"[Gemini Image] 下载用户 {target_id} 的头像失败")
+            # 过滤掉被引用用户的ID
+            filtered_at_users = [uid for uid in at_users if uid != replied_user_id]
+
+            if filtered_at_users:
+                logger.info(f"[Gemini Image] 检测到 {len(filtered_at_users)} 个@用户，正在下载头像作为参考图")
+                for target_id in filtered_at_users:
+                    avatar_data = await self.get_avatar(target_id)
+                    if avatar_data:
+                        images_data.append((avatar_data, "image/jpeg"))
+                        logger.info(f"[Gemini Image] 成功添加用户 {target_id} 的头像作为参考图")
+                    else:
+                        logger.warning(f"[Gemini Image] 下载用户 {target_id} 的头像失败")
+
+            if replied_user_id and replied_user_id in at_users:
+                logger.debug(f"[Gemini Image] 跳过被引用用户 {replied_user_id} 的头像下载")
 
         mode = f"图生图({len(images_data)}张参考图)" if images_data else "文生图"
 
