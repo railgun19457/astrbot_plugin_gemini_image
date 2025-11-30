@@ -45,8 +45,9 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                 },
                 "aspect_ratio": {
                     "type": "string",
-                    "description": "图片宽高比 (默认使用插件配置)",
+                    "description": "图片宽高比",
                     "enum": [
+                        "自动",
                         "1:1",
                         "2:3",
                         "3:2",
@@ -57,7 +58,6 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                         "9:16",
                         "16:9",
                         "21:9",
-                        "自动",
                     ],
                 },
                 "resolution": {
