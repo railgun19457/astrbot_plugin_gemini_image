@@ -165,27 +165,30 @@ class GeminiImageGenerator:
 
         last_error = "未配置 API Key"
 
-        for retry_attempt in range(self.max_retry_attempts):
-            for key_attempt in range(len(self.api_keys)):
-                if retry_attempt > 0 or key_attempt > 0:
-                    logger.info(
-                        f"[Gemini Image] {prefix}重试生成 (第 {retry_attempt + 1}/{self.max_retry_attempts} 次)"
-                    )
-
-                result = await self._try_generate_with_current_key(
-                    prompt, converted_images, aspect_ratio, image_size, task_id
+        for attempt in range(self.max_retry_attempts):
+            if attempt > 0:
+                logger.info(
+                    f"[Gemini Image] {prefix}重试生成 (第 {attempt + 1}/{self.max_retry_attempts} 次)"
                 )
 
-                if result[0] is not None:
-                    return result
+            result = await self._try_generate_with_current_key(
+                prompt, converted_images, aspect_ratio, image_size, task_id
+            )
 
-                last_error = result[1] or "生成失败"
-                if len(self.api_keys) > 1 and key_attempt < len(self.api_keys) - 1:
+            if result[0] is not None:
+                return result
+
+            last_error = result[1] or "生成失败"
+
+            if attempt < self.max_retry_attempts - 1:
+                if len(self.api_keys) > 1:
                     self._rotate_api_key()
 
-            if retry_attempt < self.max_retry_attempts - 1:
-                wait_time = min(2**retry_attempt, 10)
-                await asyncio.sleep(wait_time)
+                # 如果是单 Key，或者已经轮询了一圈 Key，则进行退避等待
+                if (attempt + 1) % len(self.api_keys) == 0:
+                    round_index = (attempt + 1) // len(self.api_keys) - 1
+                    wait_time = min(2**round_index, 10)
+                    await asyncio.sleep(wait_time)
 
         return None, f"重试失败: {last_error}"
 
