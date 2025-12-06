@@ -234,7 +234,7 @@ class GeminiImageGenerator:
     ) -> dict:
         generation_config = {"responseModalities": ["IMAGE"]}
         image_config = {}
-        if aspect_ratio:
+        if aspect_ratio and aspect_ratio != "自动":
             image_config["aspectRatio"] = aspect_ratio
 
         # imageSize 仅 gemini-3-pro-image-preview 支持

@@ -77,8 +77,9 @@
     "description": "默认宽高比",
     "hint": "使用命令生图时默认使用的图片宽高比",
     "type": "string",
-    "default": "1:1",
+    "default": "自动",
     "options": [
+      "自动",
       "1:1",
       "2:3",
       "3:2",
