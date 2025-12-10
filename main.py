@@ -164,6 +164,7 @@ class GeminiImagePlugin(Star):
             api_keys=self.api_keys,
             base_url=self.base_url,
             model=self.model,
+            api_type=self.api_type,
             timeout=self.timeout,
             max_retry_attempts=self.max_retry_attempts,
             proxy=self.proxy,
@@ -185,6 +186,7 @@ class GeminiImagePlugin(Star):
 
     def _load_config(self):
         """加载配置"""
+        self.api_type = self.config.get("api_type", "gemini")
         use_system_provider = self.config.get("use_system_provider", True)
         provider_id = (self.config.get("provider_id", "") or "").strip()
 
@@ -221,6 +223,16 @@ class GeminiImagePlugin(Star):
             max(1, max_concurrent), self.MAX_CONCURRENT_GENERATIONS
         )
 
+    def _clean_base_url(self, url: str) -> str:
+        """清洗 Base URL"""
+        if not url:
+            return ""
+        url = url.rstrip("/")
+        # 移除 /v1 及其后的所有内容 (包括 /v1beta, /v1/chat 等)
+        if "/v1" in url:
+            url = url.split("/v1", 1)[0]
+        return url.rstrip("/")
+
     def _load_provider_config(self, provider_id: str) -> bool:
         """从系统提供商加载配置"""
         provider = self.context.get_provider_by_id(provider_id)
@@ -249,12 +261,9 @@ class GeminiImagePlugin(Star):
             return False
 
         self.api_keys = api_keys
-        self.base_url = (
+        self.base_url = self._clean_base_url(
             api_base or "https://generativelanguage.googleapis.com"
-        ).rstrip("/")
-        # 移除可能的 /v1 后缀
-        if self.base_url.endswith("/v1") or self.base_url.endswith("/v1beta"):
-            self.base_url = self.base_url.rsplit("/", 1)[0]
+        )
 
         logger.info(f"[Gemini Image] 使用系统提供商: {provider_id}")
         return True
@@ -295,9 +304,8 @@ class GeminiImagePlugin(Star):
             if api_key
             else []
         )
-        self.base_url = self.config.get(
-            "base_url", "https://generativelanguage.googleapis.com"
-        ).rstrip("/")
+        default_base = "https://generativelanguage.googleapis.com"
+        self.base_url = self._clean_base_url(self.config.get("base_url", default_base))
 
     def _check_rate_limit(self, user_id: str) -> bool:
         """检查用户请求频率是否超限"""

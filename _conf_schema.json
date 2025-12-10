@@ -11,6 +11,16 @@
     "type": "bool",
     "default": true
   },
+  "api_type": {
+    "description": "API 接口类型",
+    "hint": "选择使用的 API 协议类型。Gemini 为 Google 原生协议，OpenAI 为 /v1/images/generations 协议",
+    "type": "string",
+    "default": "gemini",
+    "options": [
+      "gemini",
+      "openai"
+    ]
+  },
   "provider_id": {
     "description": "选择提供商",
     "hint": "从系统已配置的提供商中选择一个用于图像生成",
@@ -20,7 +30,7 @@
   },
   "base_url": {
     "description": "API Base URL",
-    "hint": "仅在不使用系统提供商时需要填写。Gemini API 的基础 URL,默认为官方地址",
+    "hint": "仅在不使用系统提供商时需要填写",
     "type": "string",
     "default": "https://generativelanguage.googleapis.com"
   },

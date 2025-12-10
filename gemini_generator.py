@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 from io import BytesIO
 
 import aiohttp
@@ -23,6 +24,7 @@ class GeminiImageGenerator:
         api_keys: list[str],
         base_url: str,
         model: str,
+        api_type: str = "gemini",
         timeout: int = 120,
         max_retry_attempts: int = 3,
         proxy: str | None = None,
@@ -32,6 +34,7 @@ class GeminiImageGenerator:
         self.current_key_index = 0
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.api_type = api_type
         self.timeout = timeout
         self.max_retry_attempts = max(1, min(max_retry_attempts, 10))
         self.proxy = proxy
@@ -201,25 +204,256 @@ class GeminiImageGenerator:
         task_id: str | None = None,
     ) -> tuple[list[bytes] | None, str | None]:
         """使用当前 API Key 尝试生成图片"""
+        if self.api_type == "gemini":
+            return await self._generate_gemini(
+                prompt, images_data, aspect_ratio, image_size, task_id
+            )
+        else:
+            return await self._generate_openai(
+                prompt, images_data, aspect_ratio, image_size, task_id
+            )
+
+    # ==================== OpenAI Implementation ====================
+
+    async def _generate_openai(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]],
+        aspect_ratio: str,
+        image_size: str | None,
+        task_id: str | None = None,
+    ) -> tuple[list[bytes] | None, str | None]:
+        """使用 OpenAI 兼容格式 API 生成图片 (Chat Completions)"""
         prefix = f"[{task_id}] " if task_id else ""
 
         try:
-            payload = self._build_request_payload(
+            # 统一使用 Chat Completions 接口
+            payload = self._build_openai_chat_payload(
+                prompt, images_data, aspect_ratio, image_size
+            )
+            endpoint_type = "v1/chat/completions"
+
+            session = self._get_session()
+            response_data = await self._make_openai_request(
+                session, payload, endpoint_type, task_id
+            )
+
+            if response_data is None:
+                return None, "API 请求失败"
+
+            images = self._extract_openai_chat_image(response_data)
+            if images:
+                return images, None
+
+            # 尝试提取文本错误信息
+            if "choices" in response_data and response_data["choices"]:
+                content = response_data["choices"][0].get("message", {}).get("content")
+                if content and isinstance(content, str):
+                    return None, f"未生成图片，API返回文本: {content[:100]}"
+
+            return None, "响应中未找到图片数据"
+
+        except asyncio.TimeoutError:
+            return None, "生成超时"
+        except Exception as e:
+            logger.error(f"[Gemini Image] {prefix}OpenAI 生成失败: {e}")
+            return None, f"生成失败: {str(e)}"
+
+    def _build_openai_chat_payload(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]] | None,
+        aspect_ratio: str,
+        image_size: str | None,
+    ) -> dict:
+        """构建 OpenAI Chat Completions 请求负载"""
+
+        message_content = [{"type": "text", "text": f"Generate an image: {prompt}"}]
+
+        # 处理参考图
+        if images_data:
+            for image_bytes, mime_type in images_data:
+                b64_data = base64.b64encode(image_bytes).decode("utf-8")
+                image_url = f"data:{mime_type};base64,{b64_data}"
+                message_content.append(
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                )
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": message_content}],
+            "modalities": ["image", "text"],  # 关键：指定返回模态
+            "stream": False,
+        }
+
+        # imageConfig 参数
+        image_config = {}
+        if aspect_ratio:
+            image_config["aspect_ratio"] = aspect_ratio
+
+        if image_size:
+            image_config["image_size"] = image_size
+
+        if image_config:
+            payload["image_config"] = image_config
+
+        return payload
+
+    async def _make_openai_request(
+        self,
+        session: aiohttp.ClientSession,
+        payload: dict,
+        endpoint_type: str,
+        task_id: str | None,
+    ) -> dict | None:
+        prefix = f"[{task_id}] " if task_id else ""
+
+        # 构建 URL
+        url = f"{self.base_url}/{endpoint_type}"
+
+        api_key = self._get_current_api_key()
+        masked_key = api_key[:4] + "****" + api_key[-4:] if len(api_key) > 8 else "****"
+        logger.debug(f"[Gemini Image] {prefix}Request URL: {url}, Key: {masked_key}")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            proxy=self.proxy,
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                error_preview = (
+                    error_text[:200] + "..." if len(error_text) > 200 else error_text
+                )
+                logger.error(
+                    f"[Gemini Image] {prefix}OpenAI API 错误: {response.status} - {error_preview}"
+                )
+                return None
+            return await response.json()
+
+    def _extract_openai_chat_image(self, response_data: dict) -> list[bytes] | None:
+        """从 OpenAI Chat 响应中提取图片"""
+        images = []
+
+        def _add_image(img_data: bytes):
+            if img_data not in images:
+                images.append(img_data)
+
+        # 0. 检查标准 OpenAI DALL-E 格式 (data 字段)
+        if "data" in response_data and isinstance(response_data["data"], list):
+            for item in response_data["data"]:
+                if isinstance(item, dict):
+                    b64_json = item.get("b64_json")
+                    url = item.get("url")
+                    if b64_json:
+                        try:
+                            _add_image(base64.b64decode(b64_json))
+                        except Exception:
+                            pass
+                    elif url:
+                        img_data = self._decode_image_url(url)
+                        if img_data:
+                            _add_image(img_data)
+
+        if "choices" in response_data and response_data["choices"]:
+            choice = response_data["choices"][0]
+            message = choice.get("message", {})
+            content = message.get("content")
+
+            # 1. 检查 message.content 为字符串的情况 (Markdown 图片 / Data URI)
+            if isinstance(content, str):
+                # 匹配 markdown 图片语法 ![...](url)
+                matches = re.findall(r"!\[.*?\]\((.*?)\)", content)
+                for url in matches:
+                    img_data = self._decode_image_url(url)
+                    if img_data:
+                        _add_image(img_data)
+
+                # 匹配纯文本中的 Data URI
+                pattern = re.compile(
+                    r"data\s*:\s*image/([a-zA-Z0-9.+-]+)\s*;\s*base64\s*,\s*([-A-Za-z0-9+/=_\s]+)",
+                    flags=re.IGNORECASE,
+                )
+                data_uri_matches = pattern.findall(content)
+                for _, b64_str in data_uri_matches:
+                    try:
+                        _add_image(base64.b64decode(b64_str))
+                    except Exception:
+                        pass
+
+            # 2. 检查 message.content 中的 image_url (Gemini 风格)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        image_url = part.get("image_url", {}).get("url")
+                        if image_url:
+                            img_data = self._decode_image_url(image_url)
+                            if img_data:
+                                _add_image(img_data)
+
+            # 3. 检查 message.images 字段 (非标准字段，部分实现可能使用)
+            if message.get("images"):
+                for img_item in message["images"]:
+                    url = None
+                    if isinstance(img_item, dict):
+                        url = img_item.get("url") or img_item.get("image_url", {}).get(
+                            "url"
+                        )
+                    elif isinstance(img_item, str):
+                        url = img_item
+
+                    if url:
+                        img_data = self._decode_image_url(url)
+                        if img_data:
+                            _add_image(img_data)
+
+        return images if images else None
+
+    def _decode_image_url(self, url: str) -> bytes | None:
+        """解码 data:image/...;base64,... URL"""
+        if url.startswith("data:image/") and ";base64," in url:
+            try:
+                _, _, data_part = url.partition(";base64,")
+                return base64.b64decode(data_part)
+            except Exception as e:
+                logger.error(f"[Gemini Image] Base64 解码失败: {e}")
+                return None
+        return None
+
+    # ==================== Gemini Implementation ====================
+
+    async def _generate_gemini(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]],
+        aspect_ratio: str,
+        image_size: str | None,
+        task_id: str | None = None,
+    ) -> tuple[list[bytes] | None, str | None]:
+        """使用 Gemini 格式 API 生成图片"""
+        prefix = f"[{task_id}] " if task_id else ""
+
+        try:
+            payload = self._build_gemini_payload(
                 prompt, images_data, aspect_ratio, image_size
             )
 
             session = self._get_session()
-            response_data = await self._make_api_request(session, payload, task_id)
+            response_data = await self._make_gemini_request(session, payload, task_id)
             if response_data is None:
                 return None, "API 请求失败"
 
-            result_image_data = self._extract_image_from_response(
-                response_data, task_id
-            )
+            result_image_data = self._extract_gemini_image(response_data, task_id)
             if result_image_data:
                 return result_image_data, None
 
-            # logger.error(f"[Gemini Image] {prefix}响应中未找到图片数据")
             return None, "响应中未找到图片数据"
 
         except asyncio.TimeoutError:
@@ -228,7 +462,7 @@ class GeminiImageGenerator:
             logger.error(f"[Gemini Image] {prefix}生成失败: {e}")
             return None, f"生成失败: {str(e)}"
 
-    def _build_request_payload(
+    def _build_gemini_payload(
         self,
         prompt: str,
         images_data: list[tuple[bytes, str]],
@@ -237,7 +471,8 @@ class GeminiImageGenerator:
     ) -> dict:
         generation_config = {"responseModalities": ["IMAGE"]}
         image_config = {}
-        if aspect_ratio:
+        # 如果有参考图，则不传 aspect_ratio，使用参考图的比例
+        if aspect_ratio and not images_data:
             image_config["aspectRatio"] = aspect_ratio
 
         # imageSize 仅 gemini-3-pro-image-preview 支持
@@ -280,7 +515,7 @@ class GeminiImageGenerator:
             "safetySettings": safety_settings,
         }
 
-    async def _make_api_request(
+    async def _make_gemini_request(
         self, session: aiohttp.ClientSession, payload: dict, task_id: str | None = None
     ) -> dict | None:
         prefix = f"[{task_id}] " if task_id else ""
@@ -314,7 +549,7 @@ class GeminiImageGenerator:
                 return None
             return await response.json()
 
-    def _extract_image_from_response(
+    def _extract_gemini_image(
         self, response: dict, task_id: str | None = None
     ) -> list[bytes] | None:
         """从 API 响应中提取图片数据"""
