@@ -13,7 +13,7 @@
   },
   "api_type": {
     "description": "API 接口类型",
-    "hint": "选择使用的 API 协议类型。Gemini 为 Google 原生协议，OpenAI 为 /v1/images/generations 协议",
+    "hint": "选择使用的 API 协议类型",
     "type": "string",
     "default": "gemini",
     "options": [

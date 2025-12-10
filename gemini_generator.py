@@ -241,7 +241,7 @@ class GeminiImageGenerator:
             if response_data is None:
                 return None, "API 请求失败"
 
-            images = self._extract_openai_chat_image(response_data)
+            images = await self._extract_openai_chat_image(response_data)
             if images:
                 return images, None
 
@@ -282,20 +282,21 @@ class GeminiImageGenerator:
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": message_content}],
-            "modalities": ["image", "text"],  # 关键：指定返回模态
+            "modalities": ["image", "text"],
             "stream": False,
         }
 
-        # imageConfig 参数
+        # image_config
         image_config = {}
+
         if aspect_ratio:
-            image_config["aspect_ratio"] = aspect_ratio
+            image_config["aspectRatio"] = aspect_ratio
 
         if image_size:
-            image_config["image_size"] = image_size
+            image_config["imageSize"] = image_size
 
         if image_config:
-            payload["image_config"] = image_config
+            payload["imageConfig"] = image_config
 
         return payload
 
@@ -338,13 +339,23 @@ class GeminiImageGenerator:
                 return None
             return await response.json()
 
-    def _extract_openai_chat_image(self, response_data: dict) -> list[bytes] | None:
+    async def _download_image_from_url(self, url: str) -> bytes | None:
+        """从 URL 下载图片"""
+        try:
+            session = self._get_session()
+            async with session.get(url, timeout=30) as response:
+                if response.status == 200:
+                    return await response.read()
+                else:
+                    logger.error(f"[Gemini Image] 下载图片失败: {response.status} - {url}")
+                    return None
+        except Exception as e:
+            logger.error(f"[Gemini Image] 下载图片异常: {e}")
+            return None
+
+    async def _extract_openai_chat_image(self, response_data: dict) -> list[bytes] | None:
         """从 OpenAI Chat 响应中提取图片"""
         images = []
-
-        def _add_image(img_data: bytes):
-            if img_data not in images:
-                images.append(img_data)
 
         # 0. 检查标准 OpenAI DALL-E 格式 (data 字段)
         if "data" in response_data and isinstance(response_data["data"], list):
@@ -354,13 +365,18 @@ class GeminiImageGenerator:
                     url = item.get("url")
                     if b64_json:
                         try:
-                            _add_image(base64.b64decode(b64_json))
+                            images.append(base64.b64decode(b64_json))
                         except Exception:
                             pass
                     elif url:
-                        img_data = self._decode_image_url(url)
-                        if img_data:
-                            _add_image(img_data)
+                        if url.startswith("http"):
+                            img_data = await self._download_image_from_url(url)
+                            if img_data:
+                                images.append(img_data)
+                        else:
+                            img_data = self._decode_image_url(url)
+                            if img_data:
+                                images.append(img_data)
 
         if "choices" in response_data and response_data["choices"]:
             choice = response_data["choices"][0]
@@ -372,9 +388,14 @@ class GeminiImageGenerator:
                 # 匹配 markdown 图片语法 ![...](url)
                 matches = re.findall(r"!\[.*?\]\((.*?)\)", content)
                 for url in matches:
-                    img_data = self._decode_image_url(url)
-                    if img_data:
-                        _add_image(img_data)
+                    if url.startswith("http"):
+                        img_data = await self._download_image_from_url(url)
+                        if img_data:
+                            images.append(img_data)
+                    else:
+                        img_data = self._decode_image_url(url)
+                        if img_data:
+                            images.append(img_data)
 
                 # 匹配纯文本中的 Data URI
                 pattern = re.compile(
@@ -384,7 +405,7 @@ class GeminiImageGenerator:
                 data_uri_matches = pattern.findall(content)
                 for _, b64_str in data_uri_matches:
                     try:
-                        _add_image(base64.b64decode(b64_str))
+                        images.append(base64.b64decode(b64_str))
                     except Exception:
                         pass
 
@@ -394,9 +415,14 @@ class GeminiImageGenerator:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         image_url = part.get("image_url", {}).get("url")
                         if image_url:
-                            img_data = self._decode_image_url(image_url)
-                            if img_data:
-                                _add_image(img_data)
+                            if image_url.startswith("http"):
+                                img_data = await self._download_image_from_url(image_url)
+                                if img_data:
+                                    images.append(img_data)
+                            else:
+                                img_data = self._decode_image_url(image_url)
+                                if img_data:
+                                    images.append(img_data)
 
             # 3. 检查 message.images 字段 (非标准字段，部分实现可能使用)
             if message.get("images"):
@@ -410,9 +436,14 @@ class GeminiImageGenerator:
                         url = img_item
 
                     if url:
-                        img_data = self._decode_image_url(url)
-                        if img_data:
-                            _add_image(img_data)
+                        if url.startswith("http"):
+                            img_data = await self._download_image_from_url(url)
+                            if img_data:
+                                images.append(img_data)
+                        else:
+                            img_data = self._decode_image_url(url)
+                            if img_data:
+                                images.append(img_data)
 
         return images if images else None
 
