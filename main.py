@@ -345,7 +345,7 @@ class GeminiImagePlugin(Star):
         # 移除指令前缀
         cmd_parts = user_input.split(maxsplit=1)
         if not cmd_parts:
-            return  # should not happen if command triggered
+            return
 
         # 如果只有指令本身，且没有参数
         prompt = ""

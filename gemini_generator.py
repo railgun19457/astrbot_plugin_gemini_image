@@ -314,7 +314,7 @@ class GeminiImageGenerator:
         image_config = {}
         generation_config = {}
 
-        if aspect_ratio:
+        if aspect_ratio and not images_data:
             image_config["aspectRatio"] = aspect_ratio
 
         if image_size:
@@ -575,7 +575,7 @@ class GeminiImageGenerator:
 
         # Zai 特有参数
         params = {}
-        if aspect_ratio:
+        if aspect_ratio and not images_data:
             params["image_aspect_ratio"] = aspect_ratio
         if image_size:
             params["image_resolution"] = image_size
