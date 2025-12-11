@@ -208,10 +208,34 @@ class GeminiImageGenerator:
             return await self._generate_gemini(
                 prompt, images_data, aspect_ratio, image_size, task_id
             )
+        elif self.api_type == "zai":
+            return await self._generate_zai(
+                prompt, images_data, aspect_ratio, image_size, task_id
+            )
         else:
             return await self._generate_openai(
                 prompt, images_data, aspect_ratio, image_size, task_id
             )
+
+    def _log_payload(self, payload: dict, provider: str):
+        """记录请求负载，隐藏过长的 Base64 数据"""
+        try:
+            def truncate(obj):
+                if isinstance(obj, dict):
+                    return {k: truncate(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [truncate(i) for i in obj]
+                elif isinstance(obj, str):
+                    if len(obj) > 200:
+                        return obj[:50] + f"...({len(obj)} chars)..." + obj[-20:]
+                    return obj
+                else:
+                    return obj
+
+            log_payload = truncate(payload)
+            logger.debug(f"[Gemini Image] {provider} Payload: {log_payload}")
+        except Exception:
+            pass
 
     # ==================== OpenAI Implementation ====================
 
@@ -235,7 +259,7 @@ class GeminiImageGenerator:
 
             session = self._get_session()
             response_data = await self._make_openai_request(
-                session, payload, endpoint_type, task_id
+                session, payload, endpoint_type, task_id, provider="OpenAI"
             )
 
             if response_data is None:
@@ -301,7 +325,7 @@ class GeminiImageGenerator:
 
         payload["generationConfig"] = generation_config
 
-        logger.debug(f"[Gemini Image] OpenAI Chat Payload: {payload}")
+        self._log_payload(payload, "OpenAI Chat")
 
         return payload
 
@@ -311,6 +335,7 @@ class GeminiImageGenerator:
         payload: dict,
         endpoint_type: str,
         task_id: str | None,
+        provider: str = "OpenAI",
     ) -> dict | None:
         prefix = f"[{task_id}] " if task_id else ""
 
@@ -333,13 +358,16 @@ class GeminiImageGenerator:
             timeout=aiohttp.ClientTimeout(total=self.timeout),
             proxy=self.proxy,
         ) as response:
+            logger.debug(
+                f"[Gemini Image] {prefix}API Response Status: {response.status}"
+            )
             if response.status != 200:
                 error_text = await response.text()
                 error_preview = (
                     error_text[:200] + "..." if len(error_text) > 200 else error_text
                 )
                 logger.error(
-                    f"[Gemini Image] {prefix}OpenAI API 错误: {response.status} - {error_preview}"
+                    f"[Gemini Image] {prefix}{provider} API 错误: {response.status} - {error_preview}"
                 )
                 return None
             return await response.json()
@@ -352,13 +380,17 @@ class GeminiImageGenerator:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"[Gemini Image] 下载图片失败: {response.status} - {url}")
+                    logger.error(
+                        f"[Gemini Image] 下载图片失败: {response.status} - {url}"
+                    )
                     return None
         except Exception as e:
             logger.error(f"[Gemini Image] 下载图片异常: {e}")
             return None
 
-    async def _extract_openai_chat_image(self, response_data: dict) -> list[bytes] | None:
+    async def _extract_openai_chat_image(
+        self, response_data: dict
+    ) -> list[bytes] | None:
         """从 OpenAI Chat 响应中提取图片"""
         images = []
 
@@ -421,7 +453,9 @@ class GeminiImageGenerator:
                         image_url = part.get("image_url", {}).get("url")
                         if image_url:
                             if image_url.startswith("http"):
-                                img_data = await self._download_image_from_url(image_url)
+                                img_data = await self._download_image_from_url(
+                                    image_url
+                                )
                                 if img_data:
                                     images.append(img_data)
                             else:
@@ -463,6 +497,104 @@ class GeminiImageGenerator:
                 return None
         return None
 
+    # ==================== Zai Implementation ====================
+
+    async def _generate_zai(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]],
+        aspect_ratio: str | None,
+        image_size: str | None,
+        task_id: str | None = None,
+    ) -> tuple[list[bytes] | None, str | None]:
+        """使用 Zai 格式 API 生成图片"""
+        prefix = f"[{task_id}] " if task_id else ""
+
+        try:
+            payload = self._build_zai_payload(
+                prompt, images_data, aspect_ratio, image_size
+            )
+
+            # Zai 使用 OpenAI 兼容的 endpoint
+            endpoint_type = "v1/chat/completions"
+            session = self._get_session()
+
+            # 复用 OpenAI 的请求逻辑
+            response_data = await self._make_openai_request(
+                session, payload, endpoint_type, task_id, provider="Zai"
+            )
+
+            if response_data is None:
+                return None, "API 请求失败"
+
+            # 尝试使用 OpenAI 兼容的提取逻辑
+            images = await self._extract_openai_chat_image(response_data)
+            if images:
+                return images, None
+
+            # 尝试提取文本错误信息
+            if "choices" in response_data and response_data["choices"]:
+                content = response_data["choices"][0].get("message", {}).get("content")
+                if content and isinstance(content, str):
+                    return None, f"未生成图片，API返回文本: {content[:100]}"
+
+            return None, "响应中未找到图片数据"
+
+        except asyncio.TimeoutError:
+            return None, "生成超时"
+        except Exception as e:
+            logger.error(f"[Gemini Image] {prefix}Zai 生成失败: {e}")
+            return None, f"生成失败: {str(e)}"
+
+    def _build_zai_payload(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]] | None,
+        aspect_ratio: str | None,
+        image_size: str | None,
+    ) -> dict:
+        """构建 Zai 请求负载 (OpenAI 格式 + params)"""
+
+        # Zai 不需要 "Generate an image: " 前缀，直接使用 prompt
+        message_content = [{"type": "text", "text": prompt}]
+
+        # 处理参考图 (OpenAI Vision 格式)
+        if images_data:
+            for image_bytes, mime_type in images_data:
+                b64_data = base64.b64encode(image_bytes).decode("utf-8")
+                image_url = f"data:{mime_type};base64,{b64_data}"
+                message_content.append(
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                )
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": message_content}],
+            "stream": False,
+        }
+
+        # Zai 特有参数
+        params = {}
+        if aspect_ratio:
+            params["image_aspect_ratio"] = aspect_ratio
+        if image_size:
+            params["image_resolution"] = image_size
+
+        if params:
+            payload["params"] = params
+
+        self._log_payload(payload, "Zai")
+        return payload
+
+    async def _make_zai_request(
+        self,
+        session: aiohttp.ClientSession,
+        payload: dict,
+        task_id: str | None,
+    ) -> dict | None:
+        # Deprecated: 使用 _make_openai_request 代替
+        pass
+
     # ==================== Gemini Implementation ====================
 
     async def _generate_gemini(
@@ -495,7 +627,7 @@ class GeminiImageGenerator:
         except asyncio.TimeoutError:
             return None, "生成超时"
         except Exception as e:
-            logger.error(f"[Gemini Image] {prefix}生成失败: {e}")
+            logger.error(f"[Gemini Image] {prefix}Gemini 生成失败: {e}")
             return None, f"生成失败: {str(e)}"
 
     def _build_gemini_payload(
@@ -545,20 +677,27 @@ class GeminiImageGenerator:
                     }
                 )
 
-        return {
+        payload = {
             "contents": [{"parts": parts}],
             "generationConfig": generation_config,
             "safetySettings": safety_settings,
         }
+        self._log_payload(payload, "Gemini")
+        return payload
 
     async def _make_gemini_request(
         self, session: aiohttp.ClientSession, payload: dict, task_id: str | None = None
     ) -> dict | None:
         prefix = f"[{task_id}] " if task_id else ""
         url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
+
+        api_key = self._get_current_api_key()
+        masked_key = api_key[:4] + "****" + api_key[-4:] if len(api_key) > 8 else "****"
+        logger.debug(f"[Gemini Image] {prefix}Request URL: {url}, Key: {masked_key}")
+
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-key": self._get_current_api_key(),
+            "x-goog-api-key": api_key,
         }
 
         async with session.post(
@@ -578,7 +717,7 @@ class GeminiImageGenerator:
                     error_text[:200] + "..." if len(error_text) > 200 else error_text
                 )
                 logger.error(
-                    f"[Gemini Image] {prefix}API 错误: {response.status} - {error_preview}"
+                    f"[Gemini Image] {prefix}Gemini API 错误: {response.status} - {error_preview}"
                 )
                 if response.status in [401, 403, 429]:
                     return None

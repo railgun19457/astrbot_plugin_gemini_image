@@ -18,7 +18,8 @@
     "default": "gemini",
     "options": [
       "gemini",
-      "openai"
+      "openai",
+      "zai"
     ]
   },
   "provider_id": {
