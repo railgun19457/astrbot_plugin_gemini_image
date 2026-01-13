@@ -255,6 +255,49 @@ class GeminiImagePlugin(Star):
         # 顶层配置
         self.enable_llm_tool = self.config.get("enable_llm_tool", True)
         self.presets = self._load_presets()
+        
+        # 权限配置
+        perm_conf = self.config.get("permission_config", {})
+        self.perm_mode = perm_conf.get("mode", "disable")
+        self.perm_users = set(perm_conf.get("users", []))
+        self.perm_groups = set(perm_conf.get("groups", []))
+
+    def _check_permission(self, user_id: str, group_id: str = "") -> bool:
+        """检查权限"""
+        # 实时读取配置
+        perm_conf = self.config.get("permission_config", {})
+        mode = perm_conf.get("mode", "disable").strip()
+
+        if mode == "disable":
+            return True
+            
+        user_id = str(user_id).strip()
+        group_id = str(group_id).strip()
+        
+        # 统一转为字符串集合进行比对，去除空格
+        limit_users = {str(u).strip() for u in perm_conf.get("users", [])}
+        limit_groups = {str(g).strip() for g in perm_conf.get("groups", [])}
+        
+        logger.debug(f"[Gemini Image] Perm Check: mode={mode}, user={user_id}, lists={limit_users}")
+        
+        if mode == "blacklist":
+            # 黑名单模式: 在名单内则禁止
+            if user_id in limit_users:
+                return False
+            if group_id and group_id in limit_groups:
+                return False
+            return True
+            
+        elif mode == "whitelist":
+            # 白名单模式: 在名单内才允许
+            if user_id in limit_users:
+                return True
+            if group_id and group_id in limit_groups:
+                return True
+            # 不在白名单中 -> 禁止
+            return False
+            
+        return True
 
     def _clean_base_url(self, url: str) -> str:
         """清洗 Base URL"""
@@ -360,7 +403,13 @@ class GeminiImagePlugin(Star):
     @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令"""
-        user_id = event.unified_msg_origin
+        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        group_id = event.message_obj.group_id or ""
+
+        if not self._check_permission(user_id, group_id):
+            # 权限不足时不回复或回复提示，这里选择回复提示
+            yield event.plain_result("❌ 您没有权限使用此功能")
+            return
 
         if not self._check_rate_limit(user_id):
             yield event.plain_result(
@@ -561,6 +610,13 @@ class GeminiImagePlugin(Star):
     @filter.command("生图模型")
     async def model_command(self, event: AstrMessageEvent, model_index: str = ""):
         """生图模型管理指令"""
+        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        group_id = event.message_obj.group_id or ""
+        
+        if not self._check_permission(user_id, group_id):
+            yield event.plain_result("❌ 您没有权限使用此功能")
+            return
+
         if not model_index:
             model_list = ["📋 可用模型列表:"]
             for idx, model in enumerate(self.AVAILABLE_MODELS, 1):
@@ -591,7 +647,14 @@ class GeminiImagePlugin(Star):
     @filter.command("预设")
     async def preset_command(self, event: AstrMessageEvent):
         """预设管理指令"""
-        user_id = event.unified_msg_origin
+        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        group_id = event.message_obj.group_id or ""
+        
+        if not self._check_permission(user_id, group_id):
+            yield event.plain_result("❌ 您没有权限使用此功能")
+            return
+
+        # user_id 已经是正确的ID了，不需要重新赋值（注意下面还有一行 event.unified_msg_origin 获取 mask_uid 的逻辑，可能需要调整）
         masked_uid = (
             user_id[:4] + "****" + user_id[-4:] if len(user_id) > 8 else user_id
         )
