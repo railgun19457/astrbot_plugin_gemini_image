@@ -19,6 +19,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -34,7 +35,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
     """统一的图像生成工具，支持文生图和图生图"""
 
     name: str = "gemini_generate_image"
-    description: str = "使用 Gemini 模型生成或修改图片"
+    description: str = "使用 Gemini 模型生成或修改图片(需权限验证，非授权用户请勿调用)"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -100,11 +101,34 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 无法获取当前消息上下文"
 
-        # 检查权限
-        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        # Enhanced User ID Extraction & Debugging
+        user_id = event.get_sender_id()
+        if not user_id and event.message_obj and event.message_obj.sender:
+            user_id = event.message_obj.sender.user_id
+        if not user_id:
+            user_id = event.unified_msg_origin
+        
+        user_id = str(user_id).strip()
         group_id = event.message_obj.group_id or ""
-        if hasattr(plugin, "_check_permission") and not plugin._check_permission(user_id, group_id):
-            return f"{plugin.perm_no_permission_reply} (Permission Denied)"
+
+        # DEBUG: Log the values used for permission check
+        logger.info(f"[Gemini Permission] Tool Call - User: {user_id}, Group: {group_id}")
+        if hasattr(plugin, "perm_users"):
+             logger.info(f"[Gemini Permission] Config - Mode: {plugin.perm_mode}, Users: {plugin.perm_users}")
+
+        # Permission Check
+        if hasattr(plugin, "_check_permission"):
+            if not plugin._check_permission(user_id, group_id):
+                logger.warning(f"[Gemini Permission] DENIED for User: {user_id}")
+                                # SYSTEM STOP INSTRUCTION
+                if plugin.perm_silent:
+                    return "SYSTEM_NOTIFICATION: Permission denied. User unauthorized. EXECUTION STOPPED. Do NOT generate image. Do NOT reply to the user. END."
+                else:
+                    return f"SYSTEM_NOTIFICATION: Permission denied. EXECUTION STOPPED. Reply to user: '{plugin.perm_no_permission_reply}'" 
+            else:
+                logger.info(f"[Gemini Permission] ALLOWED for User: {user_id}")
+        else:
+            logger.error("[Gemini Permission] Plugin instance missing _check_permission method")
 
         if not plugin.generator.api_keys:
             return "❌ 未配置 API Key，无法生成图片"
@@ -269,6 +293,7 @@ class GeminiImagePlugin(Star):
         self.perm_groups = set(perm_conf.get("groups", []))
         self.perm_no_permission_reply = perm_conf.get("no_permission_reply", "❌ 您没有权限使用此功能")
         self.perm_silent = perm_conf.get("silent_on_no_permission", False)
+        self.perm_intercept_keywords = perm_conf.get("intercept_keywords", ["画", "绘", "图", "draw", "image", "photo", "generate", "生图"])
 
     def _check_permission(self, user_id: str, group_id: str = "") -> bool:
         """检查权限"""
@@ -286,7 +311,7 @@ class GeminiImagePlugin(Star):
         limit_users = {str(u).strip() for u in perm_conf.get("users", [])}
         limit_groups = {str(g).strip() for g in perm_conf.get("groups", [])}
         
-        logger.debug(f"[Gemini Image] Perm Check: mode={mode}, user={user_id}, lists={limit_users}")
+        logger.info(f"[Gemini Image] Perm Check: mode={mode}, user={user_id}, lists={limit_users}, groups={limit_groups}, group_id={group_id}")
         
         if mode == "blacklist":
             # 黑名单模式: 在名单内则禁止
@@ -407,6 +432,41 @@ class GeminiImagePlugin(Star):
 
         valid_timestamps.append(now)
         return True
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def intercept_drawing_request(self, event: AstrMessageEvent):
+        "拦截无权限用户的画图请求，防止触发 LLM"
+        message_str = event.message_str or ""
+        if not message_str:
+            return
+
+        # 获取用户信息
+        user_id = event.get_sender_id()
+        if not user_id and event.message_obj and event.message_obj.sender:
+            user_id = event.message_obj.sender.user_id
+        if not user_id:
+            user_id = event.unified_msg_origin
+        user_id = str(user_id).strip()
+        group_id = event.message_obj.group_id or ""
+
+        # 检查权限
+        if self._check_permission(user_id, group_id):
+            return  # 有权限，放行
+
+        # 无权限，检查是否包含拦截关键词
+        if not self.perm_intercept_keywords:
+            return
+
+        for keyword in self.perm_intercept_keywords:
+            if keyword in message_str:
+                logger.info(f"[Gemini Image] Intercepting unauthorized drawing request from {user_id}: {message_str}")
+                
+                # 拦截
+                event.stop_event() # 停止事件传播
+                
+                if not self.perm_silent:
+                    yield event.plain_result(self.perm_no_permission_reply)
+                return
 
     @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):

@@ -203,6 +203,21 @@
         "type": "bool",
         "default": false,
         "hint": "开启后，当用户没有权限时将不回复任何消息"
+      },
+      "intercept_keywords": {
+        "description": "拦截关键词",
+        "type": "list",
+        "default": [
+          "画",
+          "绘",
+          "图",
+          "draw",
+          "image",
+          "photo",
+          "generate",
+          "生图"
+        ],
+        "hint": "当无权限用户的消息包含这些词时，直接拦截不发送给 LLM。留空则不启用关键词拦截。"
       }
     }
   }
