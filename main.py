@@ -100,6 +100,12 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 无法获取当前消息上下文"
 
+        # 检查权限
+        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        group_id = event.message_obj.group_id or ""
+        if hasattr(plugin, "_check_permission") and not plugin._check_permission(user_id, group_id):
+            return "❌ 您没有权限使用此功能 (Permission Denied)"
+
         if not plugin.generator.api_keys:
             return "❌ 未配置 API Key，无法生成图片"
 
